@@ -1,0 +1,102 @@
+CASE: return 1 + arg + 2;
+n0: (start) 
+n1: (tuple) n0.0
+n2: (tuple) n0.1
+n5: (const) 3
+n4: (+) n2, n5
+n3: (return) n1 -> n4
+
+CASE: return (1 + arg) + 2;
+n0: (start) 
+n1: (tuple) n0.0
+n2: (tuple) n0.1
+n5: (const) 3
+n4: (+) n2, n5
+n3: (return) n1 -> n4
+
+CASE: return 0 + arg;
+n0: (start) 
+n1: (tuple) n0.0
+n2: (tuple) n0.1
+n4: (return) n1 -> n2
+
+CASE: return arg + 0 + arg;
+n0: (start) 
+n1: (tuple) n0.0
+n2: (tuple) n0.1
+n4: (const) 2
+n5: (*) n2, n4
+n6: (return) n1 -> n5
+
+CASE: return 1 + arg + 2 + arg + 3;
+n0: (start) 
+n1: (tuple) n0.0
+n2: (tuple) n0.1
+n4: (+) n2, n2
+n6: (const) 6
+n3: (+) n4, n6
+n5: (return) n1 -> n3
+
+CASE: return 1 * arg;
+n0: (start) 
+n1: (tuple) n0.0
+n2: (tuple) n0.1
+n4: (return) n1 -> n2
+
+CASE: return 3 == 3;
+n0: (start) 
+n1: (tuple) n0.0
+n3: (const) 3
+n4: (const) 3
+n5: (==) n3, n4
+n6: (return) n1 -> n5
+n2: (tuple) n0.1
+
+CASE: return 3 == 4;
+n0: (start) 
+n1: (tuple) n0.0
+n3: (const) 3
+n4: (const) 4
+n5: (==) n3, n4
+n6: (return) n1 -> n5
+n2: (tuple) n0.1
+
+CASE: return 3 != 3;
+n0: (start) 
+n1: (tuple) n0.0
+n3: (const) 3
+n4: (const) 3
+n5: (!=) n3, n4
+n6: (return) n1 -> n5
+n2: (tuple) n0.1
+
+CASE: return 3 != 4;
+n0: (start) 
+n1: (tuple) n0.0
+n3: (const) 3
+n4: (const) 4
+n5: (!=) n3, n4
+n6: (return) n1 -> n5
+n2: (tuple) n0.1
+
+CASE: a := arg+1; b := a; b = 1; return a + 2;
+n0: (start) 
+n1: (tuple) n0.0
+n6: (const) 3
+n5: (return) n1 -> n6
+n2: (tuple) n0.1
+
+CASE: a := arg + 1; a = a; return a;
+n0: (start) 
+n1: (tuple) n0.0
+n2: (tuple) n0.1
+n3: (const) 1
+n4: (+) n2, n3
+n5: (return) n1 -> n4
+
+CASE: return -arg;
+n0: (start) 
+n1: (tuple) n0.0
+n2: (tuple) n0.1
+n3: (#-) n2
+n4: (return) n1 -> n3
