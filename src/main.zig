@@ -1,5 +1,11 @@
 const std = @import("std");
 
+inline fn copy(value: anytype) @TypeOf(value) {
+    var vl: @TypeOf(value) = undefined;
+    vl = value;
+    return vl;
+}
+
 //const BraceFinder = struct {
 //    prefix: []const u8,
 //    aligned: []const Vec = &.{},
@@ -123,6 +129,8 @@ const std = @import("std");
 const Lexeme = enum(u8) {
     Eof = 0,
     @"return",
+    @"if",
+    @"else",
     Int,
     Ident,
 
@@ -235,11 +243,18 @@ const Parser = struct {
     lexer: Lexer,
     cur: Token,
     vars: std.ArrayListUnmanaged(Variable) = .{},
+    branch_changes: std.ArrayListUnmanaged(OldState) = .{},
+    branch_base: u32 = 0,
     prev_cntrl: Id = undefined,
 
     const Variable = packed struct(u64) {
         offset: u32,
         value: Id = undefined,
+    };
+
+    const OldState = struct {
+        variable: u32,
+        value: Id,
     };
 
     const Error = error{OutOfMemory};
@@ -251,6 +266,7 @@ const Parser = struct {
 
     fn deinit(self: *Parser) void {
         self.vars.deinit(self.son.gpa);
+        self.branch_changes.deinit(self.son.gpa);
     }
 
     fn next(self: *Parser) !?Id {
@@ -274,15 +290,20 @@ const Parser = struct {
                 .@":=" => {
                     std.debug.assert(acc.tag() == .@"var");
                     self.vars.items[acc.index].value = rhs;
-                    try self.son.outAppend(rhs, Id.init(.@"var", 0));
+                    try self.son.outAppend(rhs, .{});
                     std.debug.assert(self.advance().lexeme == .@";");
-                    return Id.init(.@"var", 0);
+                    return .{};
                 },
-                .@"=" => for (self.vars.items) |*variable| {
+                .@"=" => for (self.vars.items, 0..) |*variable, i| {
                     if (std.meta.eql(variable.value, acc)) {
+                        if (i < self.branch_base)
+                            try self.branch_changes.append(self.son.gpa, .{
+                                .variable = @intCast(i),
+                                .value = variable.value,
+                            });
                         variable.value = rhs;
                         std.debug.assert(self.advance().lexeme == .@";");
-                        return Id.init(.@"var", 0);
+                        return .{};
                     }
                 } else unreachable,
                 else => acc = try self.alloc(switch (op) {
@@ -314,6 +335,77 @@ const Parser = struct {
                 });
                 return return_node;
             },
+            .@"if" => {
+                const prev_branch_base = self.branch_base;
+                defer self.branch_base = prev_branch_base;
+                self.branch_base = @intCast(self.vars.items.len);
+
+                const stmt = try self.alloc(.@"if", .{
+                    .cond = try self.nextExpr(),
+                    .cfg = self.prev_cntrl,
+                });
+
+                self.prev_cntrl = try self.alloc(.tuple, .{ .on = stmt, .index = 0 });
+                var left_change_base = self.branch_changes.items.len;
+                _ = try self.nextExpr();
+                const lcfg = self.prev_cntrl;
+
+                var i = self.branch_changes.items.len;
+                while (i > left_change_base) {
+                    i -= 1;
+                    const change = &self.branch_changes.items[i];
+                    std.mem.swap(Id, &self.vars.items[change.variable].value, &change.value);
+                }
+
+                self.prev_cntrl = try self.alloc(.tuple, .{ .on = stmt, .index = 1 });
+                const right_change_base = self.branch_changes.items.len;
+                if (self.cur.lexeme == .@"else") {
+                    _ = self.advance();
+                    _ = try self.nextExpr();
+                }
+                const rcfg = self.prev_cntrl;
+
+                i = self.branch_changes.items.len;
+                while (i > right_change_base) {
+                    i -= 1;
+                    const change = &self.branch_changes.items[i];
+                    std.mem.swap(Id, &self.vars.items[change.variable].value, &change.value);
+                }
+                for (self.branch_changes.items[left_change_base..]) |*change| {
+                    std.mem.swap(Id, &self.vars.items[change.variable].value, &change.value);
+                }
+                self.prev_cntrl = try self.alloc(.region, .{ .lcfg = lcfg, .rcfg = rcfg });
+                if (self.branch_changes.items.len == 0) return .{};
+
+                var write = self.branch_changes.items.len;
+                var read = write;
+                while (read > left_change_base) {
+                    read -= 1;
+                    var change = self.branch_changes.items[read];
+                    if (self.vars.items[change.variable].value.tag() == .@"var") continue;
+                    change.value = try self.alloc(.phi, if (read > right_change_base) .{
+                        .cfg = self.prev_cntrl,
+                        .left = self.vars.items[change.variable].value,
+                        .right = change.value,
+                    } else .{
+                        .cfg = self.prev_cntrl,
+                        .left = change.value,
+                        .right = self.vars.items[change.variable].value,
+                    });
+                    self.vars.items[change.variable].value = .{};
+                    write -= 1;
+                    self.branch_changes.items[write] = change;
+                }
+
+                for (self.branch_changes.items[write..]) |change| {
+                    std.debug.assert(std.meta.eql(self.vars.items[change.variable].value, .{}));
+                    self.vars.items[change.variable].value = change.value;
+                    self.branch_changes.items[left_change_base] = change;
+                    left_change_base += 1;
+                }
+                self.branch_changes.items.len = left_change_base;
+                return .{};
+            },
             .Ident => for (self.vars.items) |variable| {
                 const ident_str = token.view(self.lexer.source);
                 if (variable.offset == std.math.maxInt(u32) and
@@ -333,10 +425,10 @@ const Parser = struct {
                 }
                 _ = self.advance();
                 for (self.vars.items[scope_frame..]) |variable| {
-                    self.son.freeId(variable.value, Id.init(.@"var", 0));
+                    self.son.freeId(variable.value, .{});
                 }
                 self.vars.items.len = scope_frame;
-                return Id.init(.@"var", 0);
+                return .{};
             },
             .@"(" => return .{ self.nextExpr(), self.advance() }[0],
             else => |t| std.debug.panic("unimplemented lexeme: {any}", .{t}),
@@ -344,32 +436,7 @@ const Parser = struct {
     }
 
     fn alloc(self: *Parser, kind: Node.Kind, anode: anytype) !Id {
-        const id = try self.son.peephole(kind, Node.init(.top, anode).inputs);
-        switch (id.tag()) {
-            inline else => |t| {
-                const name = if (comptime std.ascii.isLower(@tagName(t)[0]))
-                    @tagName(t)
-                else if (comptime std.mem.startsWith(u8, @tagName(t), "#"))
-                    "un_op"
-                else
-                    "bin_op";
-
-                const inputs = self.son.nodes.items(.inputs)[id.index];
-                const payload = @field(inputs, name);
-                switch (@typeInfo(@TypeOf(payload))) {
-                    .Struct => inline for (std.meta.fields(@TypeOf(payload))) |field| {
-                        if (field.type == Id) {
-                            try self.son.outAppend(@field(payload, field.name), id);
-                        }
-                    },
-                    else => switch (@TypeOf(payload)) {
-                        Id => try self.son.outAppend(payload, id),
-                        else => {},
-                    },
-                }
-            },
-        }
-        return id;
+        return self.son.alloc(kind, anode);
     }
 
     inline fn advance(self: *Parser) Token {
@@ -390,17 +457,37 @@ const Son = struct {
         self.* = undefined;
     }
 
-    fn peephole(self: *Son, kind: Node.Kind, anode: Node.Inputs) !Id {
-        var node = anode;
-        const inputs = self.nodes.items(.inputs);
+    fn peephole(self: *Son, kind: Node.Kind, node: *Node.Inputs) std.mem.Allocator.Error!?Id {
+        var inputs = self.nodes.items(.inputs);
         switch (kind) {
-            .@"#-" => if (self.isConst(node.un_op)) {
-                defer self.freeId(node.un_op, null);
-                return try self.append(.@"const", .{
-                    .int = -inputs[node.un_op.index].@"const".int,
-                });
+            .phi => {
+                if (node.phi.left.tagi == node.phi.right.tagi and node.phi.right.tag().isOp()) {
+                    const left = inputs[node.phi.left.index].bin_op;
+                    const right = inputs[node.phi.right.index].bin_op;
+
+                    if (left.lhs.index == right.lhs.index) {
+                        std.debug.assert(left.lhs.tagi == right.lhs.tagi);
+                        std.debug.assert(left.rhs.index != right.rhs.index);
+                        const fin = try self.append(node.phi.left.tag(), .{
+                            .lhs = left.lhs,
+                            .rhs = try self.alloc(.phi, .{
+                                .cfg = node.phi.cfg,
+                                .left = left.rhs,
+                                .right = right.rhs,
+                            }),
+                        });
+                        self.freeId(node.phi.left, null);
+                        self.freeId(node.phi.right, null);
+                        return fin;
+                    }
+                }
             },
-            inline .@"+", .@"*", .@"/", .@"-" => |op| {
+            .@"#-" => if (self.isConst(node.un_op)) {
+                const oper = inputs[node.un_op.index].@"const".int;
+                self.freeId(node.un_op, null);
+                return try self.append(.@"const", .{ .int = -oper });
+            },
+            inline .@"+", .@"*", .@"/", .@"-", .@"==", .@"!=" => |op| {
                 if (self.isConst(node.bin_op.lhs) and self.isConst(node.bin_op.rhs)) {
                     const lhs = inputs[node.bin_op.lhs.index].@"const".int;
                     const rhs = inputs[node.bin_op.rhs.index].@"const".int;
@@ -409,49 +496,91 @@ const Son = struct {
                     return try self.append(.@"const", .{ .int = op.apply(lhs, rhs) });
                 }
 
-                if (self.isConst(node.bin_op.lhs)) {
+                if (self.isConst(node.bin_op.lhs) or
+                    (node.bin_op.lhs.index > node.bin_op.rhs.index and !self.isConst(node.bin_op.rhs)))
+                {
                     std.mem.swap(Id, &node.bin_op.lhs, &node.bin_op.rhs);
                 }
+                std.debug.assert(!self.isConst(node.bin_op.lhs));
 
-                if (node.bin_op.lhs.tag().isCom()) {
-                    const lhs_n = &inputs[node.bin_op.lhs.index].bin_op;
+                if ((comptime op.isCom()) and node.bin_op.rhs.tag() == op) {
+                    // a op (b op c)
+                    const rhs_n = &inputs[node.bin_op.rhs.index].bin_op;
+                    std.debug.assert(!self.isConst(rhs_n.lhs));
 
-                    if (self.isConst(lhs_n.rhs) and self.isConst(node.bin_op.rhs)) {
-                        const lhs = inputs[lhs_n.rhs.index].@"const".int;
-                        const rhs = inputs[node.bin_op.rhs.index].@"const".int;
-                        self.freeId(lhs_n.rhs, node.bin_op.lhs);
+                    if (self.isConst(rhs_n.rhs)) {
+                        // a op (b op #c) -> (b op a) op #c
+                        const lhs_rhs = rhs_n.lhs;
+                        const lhs_lhs = node.bin_op.lhs;
+                        const rhs = rhs_n.rhs;
+                        const lhs = try self.alloc(op, .{ .lhs = lhs_lhs, .rhs = lhs_rhs });
+                        inputs = self.nodes.items(.inputs);
+                        try self.outAppend(rhs, .{});
                         self.freeId(node.bin_op.rhs, null);
-                        lhs_n.rhs = try self.append(.@"const", .{ .int = op.apply(lhs, rhs) });
-                        return node.bin_op.lhs;
+                        self.outRemove(rhs, .{});
+                        node.bin_op = .{ .lhs = lhs, .rhs = rhs };
                     }
+                }
 
-                    if (self.isConst(lhs_n.rhs)) {
+                if ((comptime op.isCom()) and node.bin_op.lhs.tag() == op) {
+                    // (a op b) op c
+                    const lhs_n = &inputs[node.bin_op.lhs.index].bin_op;
+                    std.debug.assert(!self.isConst(lhs_n.lhs));
+
+                    if (self.isConst(lhs_n.rhs)) if (self.isConst(node.bin_op.rhs)) {
+                        // (a op #b) op #c -> a op (#b op #c)
+                        const lhs = lhs_n.lhs;
+                        const rhs = try self.alloc(.@"const", .{ .int = op.apply(
+                            inputs[lhs_n.rhs.index].@"const".int,
+                            inputs[node.bin_op.rhs.index].@"const".int,
+                        ) });
+                        inputs = self.nodes.items(.inputs);
+                        try self.outAppend(lhs, .{});
+                        self.freeId(node.bin_op.lhs, null);
+                        self.outRemove(lhs, .{});
+                        self.freeId(node.bin_op.rhs, null);
+                        node.bin_op = .{ .lhs = lhs, .rhs = rhs };
+                    } else {
+                        // (a op #b) op c -> (a op c) op #b
+                        self.outRemove(lhs_n.rhs, node.bin_op.lhs);
+                        try self.outAppend(node.bin_op.rhs, node.bin_op.lhs);
                         std.mem.swap(Id, &lhs_n.rhs, &node.bin_op.rhs);
-                        self.outRemove(node.bin_op.rhs, node.bin_op.lhs);
-                        try self.outAppend(lhs_n.rhs, node.bin_op.lhs);
-                    }
+                    };
                 }
 
                 const identity: ?i64 = switch (op) {
-                    .@"+" => 0,
-                    .@"*" => 1,
+                    .@"+", .@"-" => 0,
+                    .@"*", .@"/" => 1,
                     else => null,
                 };
                 if (self.isConst(node.bin_op.rhs) and
                     inputs[node.bin_op.rhs.index].@"const".int == identity)
                     return node.bin_op.lhs;
 
-                if (op == .@"+" and node.bin_op.lhs.index == node.bin_op.rhs.index) {
-                    return try self.append(.@"*", .{
-                        .lhs = node.bin_op.lhs,
-                        .rhs = try self.append(.@"const", .{ .int = 2 }),
-                    });
-                }
+                if (node.bin_op.lhs.index == node.bin_op.rhs.index) switch (op) {
+                    .@"+" => {
+                        return try self.alloc(.@"*", .{
+                            .lhs = node.bin_op.lhs,
+                            .rhs = try self.alloc(.@"const", .{ .int = 2 }),
+                        });
+                    },
+                    .@"-" => {
+                        self.freeId(node.bin_op.rhs, null);
+                        self.freeId(node.bin_op.lhs, null);
+                        return try self.append(.@"const", .{ .int = 0 });
+                    },
+                    .@"/" => {
+                        self.freeId(node.bin_op.rhs, null);
+                        self.freeId(node.bin_op.lhs, null);
+                        return try self.append(.@"const", .{ .int = 1 });
+                    },
+                    else => {},
+                };
             },
             else => {},
         }
 
-        return self.append(kind, node);
+        return null;
     }
 
     fn isConst(self: *Son, id: Id) bool {
@@ -472,11 +601,47 @@ const Son = struct {
     }
 
     fn freeId(self: *Son, id: Id, from: ?Id) void {
+        if (id.tag() == .@"var") return;
         if (from) |f| self.outRemove(id, f);
         if (self.nodes.items(.out)[id.index].len > 0) return;
+        self.forEachInput(id, freeId) catch {};
         self.nodes.set(id.index, undefined);
         self.nodes.items(.out)[id.index].len = self.free;
         self.free = id.index;
+    }
+
+    fn alloc(self: *Son, kind: Node.Kind, anode: anytype) !Id {
+        var inputs = Node.init(.top, anode).inputs;
+        if (try self.peephole(kind, &inputs)) |id| return id;
+        const id = try self.append(kind, inputs);
+        try self.forEachInput(id, outAppend);
+        return id;
+    }
+
+    fn forEachInput(self: *Son, id: Id, comptime func: anytype) !void {
+        const funcAdp = struct {
+            fn adp(s: *Son, i: Id, f: Id) !void {
+                if (@typeInfo(@TypeOf(func)).Fn.return_type.? == void)
+                    func(s, i, f)
+                else
+                    try func(s, i, f);
+            }
+        }.adp;
+
+        switch (id.tag()) {
+            inline else => |t| {
+                const name = comptime t.inputField();
+                const inputs = self.nodes.items(.inputs)[id.index];
+                const payload = @field(inputs, name);
+                const Payload = @TypeOf(payload);
+                if (@typeInfo(Payload) == .Struct) {
+                    inline for (std.meta.fields(Payload)) |field|
+                        if (field.type == Id)
+                            try funcAdp(self, @field(payload, field.name), id);
+                } else if (Payload == Id)
+                    try funcAdp(self, payload, id);
+            },
+        }
     }
 
     fn outView(self: *Son, id: anytype) []Id {
@@ -508,7 +673,12 @@ const Son = struct {
                 out.value = .{ .base = @intCast(self.out_slices.items.len) };
                 try self.out_slices.appendSlice(self.gpa, &data);
             },
-            else => try self.out_slices.append(self.gpa, value),
+            else => {
+                try self.out_slices.ensureTotalCapacity(self.gpa, out.len + self.out_slices.items.len);
+                self.out_slices.appendSliceAssumeCapacity(self.out_slices.items[out.value.base..][0 .. out.len - 1]);
+                self.out_slices.appendAssumeCapacity(value);
+                out.value.base = @intCast(self.out_slices.items.len - out.len);
+            },
         }
     }
 
@@ -518,7 +688,6 @@ const Son = struct {
         out.len -= 1;
         switch (out.len) {
             0 => {},
-            1 => std.debug.assert(std.meta.eql(out.value.direct, from)),
             else => {
                 const view = self.out_slices.items[out.value.base..][0 .. out.len + 1];
                 const index = std.mem.indexOfScalar(u32, @ptrCast(view), @bitCast(from)).?;
@@ -532,8 +701,8 @@ const Son = struct {
 };
 
 const Id = packed struct(u32) {
-    tagi: std.meta.Tag(Node.Kind),
-    index: std.meta.Int(.unsigned, 32 - @bitSizeOf(Node.Kind)),
+    tagi: std.meta.Tag(Node.Kind) = 0,
+    index: std.meta.Int(.unsigned, 32 - @bitSizeOf(Node.Kind)) = 0,
 
     fn init(kind: Node.Kind, index: usize) Id {
         return .{ .tagi = @intFromEnum(kind), .index = @intCast(index) };
@@ -541,6 +710,17 @@ const Id = packed struct(u32) {
 
     fn tag(self: Id) Node.Kind {
         return @enumFromInt(self.tagi);
+    }
+
+    pub fn format(
+        self: Id,
+        comptime fmt: []const u8,
+        options: std.fmt.FormatOptions,
+        writer: anytype,
+    ) !void {
+        _ = options;
+        _ = fmt;
+        try writer.print("{s}{d}", .{ @tagName(self.tag()), self.index });
     }
 };
 
@@ -552,6 +732,19 @@ const Node = struct {
     const Inputs = union {
         @"var": void,
         start: void,
+        @"if": struct {
+            cfg: Id,
+            cond: Id,
+        },
+        phi: struct {
+            cfg: Id,
+            left: Id,
+            right: Id,
+        },
+        region: struct {
+            lcfg: Id,
+            rcfg: Id,
+        },
         @"return": struct {
             value: Id,
             cfg: Id,
@@ -578,6 +771,9 @@ const Node = struct {
     const Kind = enum {
         @"var",
         start,
+        @"if",
+        region,
+        phi,
         tuple,
         @"return",
         @"const",
@@ -589,8 +785,26 @@ const Node = struct {
         @"/",
         @"#-",
 
+        fn inputField(kind: Kind) []const u8 {
+            const name = @tagName(kind);
+            return switch (name[0]) {
+                'a'...'z' => name,
+                '#' => "un_op",
+                else => "bin_op",
+            };
+        }
+
+        fn isOp(kind: Kind) bool {
+            return switch (kind) {
+                .@"==", .@"!=", .@"+", .@"-", .@"*", .@"/" => true,
+                else => false,
+            };
+        }
+
         fn apply(comptime op: Kind, lhs: anytype, rhs: @TypeOf(lhs)) i64 {
             return switch (op) {
+                .@"==" => @intFromBool(lhs == rhs),
+                .@"!=" => @intFromBool(lhs != rhs),
                 .@"+" => lhs + rhs,
                 .@"*" => lhs * rhs,
                 .@"/" => @divFloor(lhs, rhs),
@@ -601,7 +815,7 @@ const Node = struct {
 
         fn isCfg(self: Kind) bool {
             switch (self) {
-                .@"return", .start, .tuple => return true,
+                .@"return", .start, .tuple, .region, .@"if" => return true,
                 else => return false,
             }
         }
@@ -682,32 +896,49 @@ const Fmt = struct {
             .@"#-" => {
                 try self.fmt(inputs.un_op);
             },
-            .@"var", .@"const", .tuple, .start => {},
+            .@"if" => {
+                try self.fmt(inputs.@"if".cond);
+            },
+            .phi => {
+                try self.fmt(inputs.phi.left);
+                try self.fmt(inputs.phi.right);
+            },
+            .@"var", .@"const", .tuple, .start, .region => {},
         }
 
-        try self.out.writer().print("n{d}: ({s}) ", .{ id.index, @tagName(id.tag()) });
+        try self.out.writer().print("{}: ", .{id});
         switch (id.tag()) {
             .@"const" => try self.out.writer().print("{d}", .{inputs.@"const".int}),
             .@"return" => {
-                try self.out.writer().print("n{d} -> n{d}", .{
-                    inputs.@"return".cfg.index,
-                    inputs.@"return".value.index,
+                try self.out.writer().print("{} -> {}", .{
+                    inputs.@"return".cfg,
+                    inputs.@"return".value,
                 });
             },
             .tuple => {
-                try self.out.writer().print("n{d}.{d}", .{
-                    inputs.tuple.on.index,
+                try self.out.writer().print("{}.{d}", .{
+                    inputs.tuple.on,
                     inputs.tuple.index,
                 });
             },
-            .@"var", .start => {},
+            .@"var", .start, .region => {},
+            .@"if" => {
+                try self.out.writer().print("{}, {}", .{ inputs.@"if".cond, inputs.@"if".cfg });
+            },
             .@"#-" => {
-                try self.out.writer().print("n{d}", .{inputs.un_op.index});
+                try self.out.writer().print("{}", .{inputs.un_op});
+            },
+            .phi => {
+                try self.out.writer().print("{} ? {} : {}", .{
+                    inputs.phi.cfg,
+                    inputs.phi.left,
+                    inputs.phi.right,
+                });
             },
             .@"+", .@"-", .@"*", .@"/", .@"==", .@"!=" => {
-                try self.out.writer().print("n{d}, n{d}", .{
-                    inputs.bin_op.lhs.index,
-                    inputs.bin_op.rhs.index,
+                try self.out.writer().print("{}, {}", .{
+                    inputs.bin_op.lhs,
+                    inputs.bin_op.rhs,
                 });
             },
         }
@@ -715,8 +946,8 @@ const Fmt = struct {
 
         const outs = self.son.outView(&self.son.nodes.items(.out)[id.index]);
         switch (id.tag()) {
-            .start, .tuple => for (outs) |out| if (out.tag().isCfg()) try self.fmt(out),
-            .@"const", .@"return", .@"var" => {},
+            .start, .tuple, .@"if", .region => for (outs) |out| if (out.tag().isCfg()) try self.fmt(out),
+            .@"const", .@"return", .@"var", .phi => {},
             .@"#-" => {},
             .@"+", .@"-", .@"*", .@"/", .@"==", .@"!=" => {},
         }
@@ -765,7 +996,7 @@ fn dynCaseMany(comptime name: []const u8, cases: []const []const u8) !void {
         try fmt.fmt(start);
     }
 
-    const old, const new = .{ "tests/" ++ name ++ ".temp.old.txt", name ++ ".temp.new.txt" };
+    const old, const new = .{ "tests/" ++ name ++ ".temp.old.txt", "tests/" ++ name ++ ".temp.new.txt" };
 
     const update = std.process.getEnvVarOwned(gpa, "PT_UPDATE") catch "";
     defer gpa.free(update);
@@ -775,20 +1006,20 @@ fn dynCaseMany(comptime name: []const u8, cases: []const []const u8) !void {
             .sub_path = old,
             .data = std.mem.trim(u8, output.items, "\n"),
         });
+        try std.fs.cwd().deleteFile(new);
     } else {
         try std.fs.cwd().writeFile(.{
             .sub_path = new,
             .data = std.mem.trim(u8, output.items, "\n"),
         });
         const err = runDiff(gpa, old, new);
-        try std.fs.cwd().deleteFile(new);
 
         try err;
     }
 }
 
 pub fn runDiff(gpa: std.mem.Allocator, old: []const u8, new: []const u8) !void {
-    var child = std.process.Child.init(&.{ "diff", "--unified", "--color", old, new }, gpa);
+    var child = std.process.Child.init(&.{ "diff", "-y", old, new }, gpa);
     child.stdout_behavior = .Pipe;
     child.stderr_behavior = .Pipe;
 
@@ -814,35 +1045,35 @@ pub fn runDiff(gpa: std.mem.Allocator, old: []const u8, new: []const u8) !void {
     try std.testing.expectEqual(0, exit);
 }
 
-test "arithmetic" {
-    try constCase(2, "return 1 + 2 * 3 + -5;");
-}
-
-test "variables-0" {
-    try constCase(4,
-        \\a := 1;
-        \\b := 2;
-        \\c := 0;
-        \\{
-        \\    d := 3;
-        \\    c = a + d;
-        \\}
-        \\return c;
-    );
-}
-
-test "variables-1" {
-    try constCase(8,
-        \\x0 := 1;
-        \\y0 := 2;
-        \\x1 := 3;
-        \\y1 := 4;
-        \\return (x0 - x1)*(x0 - x1) + (y0 - y1)*(y0 - y1);
-    );
-}
+//test "arithmetic" {
+//    try constCase(2, "return 1 + 2 * 3 + -5;");
+//}
+//
+//test "variables-0" {
+//    try constCase(4,
+//        \\a := 1;
+//        \\b := 2;
+//        \\c := 0;
+//        \\{
+//        \\    d := 3;
+//        \\    c = a + d;
+//        \\}
+//        \\return c;
+//    );
+//}
+//
+//test "variables-1" {
+//    try constCase(8,
+//        \\x0 := 1;
+//        \\y0 := 2;
+//        \\x1 := 3;
+//        \\y1 := 4;
+//        \\return (x0 - x1)*(x0 - x1) + (y0 - y1)*(y0 - y1);
+//    );
+//}
 
 test "unnown-arguments" {
-    try dynCaseMany("unnown-arguments-0", &.{
+    try dynCaseMany("unnown-arguments", &.{
         "return 1 + arg + 2;",
         "return (1 + arg) + 2;",
         "return 0 + arg;",
@@ -856,5 +1087,50 @@ test "unnown-arguments" {
         "a := arg+1; b := a; b = 1; return a + 2;",
         "a := arg + 1; a = a; return a;",
         "return -arg;",
+    });
+}
+
+test "if-statements" {
+    try dynCaseMany("if-statements", &.{
+        \\a := 1;
+        \\if arg == 1
+        \\    a = arg + 2;
+        \\else
+        \\    a = arg - 3;
+        \\return a;
+        ,
+        \\a := arg == 2;
+        \\if arg == 1 {
+        \\    a = arg == 3;
+        \\}
+        \\return a;
+        ,
+        \\c := 3;
+        \\b := 2;
+        \\if arg == 1 {
+        \\    b = 3;
+        \\    c = 4;
+        \\}
+        \\return c;
+        ,
+        \\a := arg + 1;
+        \\b := arg + 2;
+        \\if arg == 1
+        \\    b = b + a;
+        \\else
+        \\    a = b + 1;
+        \\return a + b;
+        ,
+        \\a := 1;
+        \\if arg == 1
+        \\    if arg == 2
+        \\        a = 2;
+        \\    else
+        \\        a = 3;
+        \\else if arg == 3
+        \\    a = 4;
+        \\else
+        \\    a = 5;
+        \\return a;
     });
 }

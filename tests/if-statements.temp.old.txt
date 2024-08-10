@@ -1,0 +1,133 @@
+CASE: a := 1;
+if arg == 1
+    a = arg + 2;
+else
+    a = arg - 3;
+return a;
+start0: 
+tuple1: start0.0
+tuple2: start0.1
+const4: 1
+==5: tuple2, const4
+if6: ==5, tuple1
+tuple7: if6.0
+region13: 
+const8: 2
++9: tuple2, const8
+const11: 3
+-12: tuple2, const11
+phi14: region13 ? +9 : -12
+return15: region13 -> phi14
+tuple10: if6.1
+
+CASE: a := arg == 2;
+if arg == 1 {
+    a = arg == 3;
+}
+return a;
+start0: 
+tuple1: start0.0
+tuple2: start0.1
+const5: 1
+==6: tuple2, const5
+if7: ==6, tuple1
+tuple8: if7.0
+region12: 
+const3: 2
+const9: 3
+phi13: region12 ? const3 : const9
+==14: tuple2, phi13
+return10: region12 -> ==14
+tuple11: if7.1
+
+CASE: c := 3;
+b := 2;
+if arg == 1 {
+    b = 3;
+    c = 4;
+}
+return c;
+start0: 
+tuple1: start0.0
+tuple2: start0.1
+const5: 1
+==6: tuple2, const5
+if7: ==6, tuple1
+tuple8: if7.0
+region12: 
+const3: 3
+const10: 4
+phi13: region12 ? const3 : const10
+return15: region12 -> phi13
+tuple11: if7.1
+
+CASE: a := arg + 1;
+b := arg + 2;
+if arg == 1
+    b = b + a;
+else
+    a = b + 1;
+return a + b;
+start0: 
+tuple1: start0.0
+tuple2: start0.1
+const7: 1
+==8: tuple2, const7
+if9: ==8, tuple1
+tuple10: if9.0
+region18: 
+const5: 2
++6: tuple2, const5
+const11: 2
+*12: tuple2, const11
+const14: 3
++13: *12, const14
+phi16: region18 ? +6 : +13
+const3: 1
+const17: 3
+phi19: region18 ? const3 : const17
++20: tuple2, phi19
++21: phi16, +20
+return22: region18 -> +21
+tuple15: if9.1
+
+CASE: a := 1;
+if arg == 1
+    if arg == 2
+        a = 2;
+    else
+        a = 3;
+else if arg == 3
+    a = 4;
+else
+    a = 5;
+return a;
+start0: 
+tuple1: start0.0
+tuple2: start0.1
+const4: 1
+==5: tuple2, const4
+if6: ==5, tuple1
+tuple7: if6.0
+const8: 2
+==9: tuple2, const8
+if10: ==9, tuple7
+tuple11: if10.0
+region15: 
+region27: 
+const12: 2
+const14: 3
+phi16: region15 ? const12 : const14
+const22: 4
+const24: 5
+phi26: region25 ? const22 : const24
+phi28: region27 ? phi16 : phi26
+return29: region27 -> phi28
+tuple13: if10.1
+tuple17: if6.1
+const18: 3
+==19: tuple2, const18
+if20: ==19, tuple17
+tuple21: if20.0
+region25: 
+tuple23: if20.1
