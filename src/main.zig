@@ -352,10 +352,9 @@ const Parser = struct {
                     null;
                 const stmt = try self.alloc(.@"if", .{ .cond = cond, .cfg = self.prev_cntrl });
 
-                self.prev_cntrl = try self.alloc(.tuple, Node.init(
-                    if (cond_val == 0) .CtrlTop else .CtrlBot,
-                    .{ .on = stmt, .index = 0 },
-                ));
+                self.prev_cntrl = if (cond_val == null)
+                    try self.alloc(.tuple, .{ .on = stmt, .index = 0 })
+                else if (cond_val == 0) .{} else self.prev_cntrl;
                 var left_change_base = self.branch_changes.items.len;
                 _ = try self.nextExpr();
                 const lcfg = self.prev_cntrl;
@@ -367,10 +366,9 @@ const Parser = struct {
                     std.mem.swap(Id, &self.vars.items[change.variable].value, &change.value);
                 }
 
-                self.prev_cntrl = try self.alloc(.tuple, Node.init(
-                    if (cond_val == 1) .CtrlTop else .CtrlBot,
-                    .{ .on = stmt, .index = 1 },
-                ));
+                self.prev_cntrl = if (cond_val == null)
+                    try self.alloc(.tuple, .{ .on = stmt, .index = 1 })
+                else if (cond_val != 0) .{} else self.prev_cntrl;
                 const right_change_base = self.branch_changes.items.len;
                 if (self.cur.lexeme == .@"else") {
                     _ = self.advance();
@@ -387,7 +385,7 @@ const Parser = struct {
                 for (self.branch_changes.items[left_change_base..]) |*change| {
                     std.mem.swap(Id, &self.vars.items[change.variable].value, &change.value);
                 }
-                self.prev_cntrl = try self.alloc(.region, .{ .lcfg = lcfg, .rcfg = rcfg });
+                const region = try self.alloc(.region, .{ .lcfg = lcfg, .rcfg = rcfg });
 
                 var write = self.branch_changes.items.len;
                 var read = write;
@@ -396,11 +394,11 @@ const Parser = struct {
                     var change = self.branch_changes.items[read];
                     if (self.vars.items[change.variable].value.tag() == .@"var") continue;
                     change.value = try self.alloc(.phi, if (read > right_change_base) .{
-                        .cfg = self.prev_cntrl,
+                        .cfg = region,
                         .left = self.vars.items[change.variable].value,
                         .right = change.value,
                     } else .{
-                        .cfg = self.prev_cntrl,
+                        .cfg = region,
                         .left = change.value,
                         .right = self.vars.items[change.variable].value,
                     });
@@ -416,6 +414,11 @@ const Parser = struct {
                     left_change_base += 1;
                 }
                 self.branch_changes.items.len = left_change_base;
+
+                if (cond_val == null) self.prev_cntrl = region else {
+                    self.prev_cntrl = if (cond_val == 0) rcfg else lcfg;
+                    self.son.freeId(region, null);
+                }
 
                 return .{};
             },
@@ -475,11 +478,11 @@ const Son = struct {
         switch (kind) {
             .phi => {
                 const region = inputs[node.phi.cfg.index].region;
-                if (region.lcfg.tag().isTerminal()) {
+                if (region.rcfg.tag().isTerminal()) {
                     self.freeId(node.phi.right, null);
                     return node.phi.left;
                 }
-                if (region.rcfg.tag().isTerminal()) {
+                if (region.lcfg.tag().isTerminal()) {
                     self.freeId(node.phi.left, null);
                     return node.phi.right;
                 }
@@ -506,8 +509,6 @@ const Son = struct {
                 }
             },
             inline .region, .@"if", .@"return", .tuple => |op| b: {
-                const types = self.nodes.items(.type);
-
                 var isDead = true;
                 comptime var reached = false;
                 switch (op) {
@@ -521,8 +522,7 @@ const Son = struct {
                             if (comptime std.mem.indexOf(u8, field.name, "cfg") == null)
                                 continue;
                             isDead = isDead and
-                                (types[@field(payload, field.name).index] == .CtrlTop or
-                                @field(payload, field.name).tag().isTerminal());
+                                @field(payload, field.name).tag().isTerminal();
                             reached = true;
                         }
                     },
@@ -543,7 +543,7 @@ const Son = struct {
                     },
                 }
 
-                return try self.append(op, Node.init(.CtrlTop, node.*));
+                return .{};
             },
             .@"#-" => if (self.isConst(node.un_op)) {
                 const oper = inputs[node.un_op.index].@"const".int;
@@ -665,7 +665,10 @@ const Son = struct {
 
     fn freeId(self: *Son, id: Id, from: ?Id) void {
         if (id.tag() == .@"var") return;
-        if (from) |f| self.outRemove(id, f);
+        if (from) |f| {
+            self.outRemove(id, f);
+        }
+
         if (self.nodes.items(.out)[id.index].len > 0) return;
         self.forEachInput(id, freeId) catch {};
         self.nodes.set(id.index, undefined);
@@ -707,26 +710,19 @@ const Son = struct {
         }
     }
 
-    fn outView(self: *Son, id: anytype) []Id {
-        const out = switch (@TypeOf(id)) {
-            *Node.Out => id,
-            Id => &self.nodes.items(.out)[id.index],
-            else => @compileError("wat"),
-        };
+    fn outView(self: *Son, id: Id) []Id {
+        const out = &self.nodes.items(.out)[id.index];
 
         switch (out.len) {
             0 => return &[_]Id{},
             1 => return @as([*]Id, @ptrCast(&out.value.direct))[0..1],
-            else => return self.out_slices.items[out.value.base..][0..id.len],
+            else => return self.out_slices.items[out.value.base..][0..out.len],
         }
     }
 
-    fn outAppend(self: *Son, id: anytype, value: Id) !void {
-        const out = switch (@TypeOf(id)) {
-            *Node.Out => id,
-            Id => &self.nodes.items(.out)[id.index],
-            else => @compileError("wat"),
-        };
+    fn outAppend(self: *Son, id: Id, value: Id) !void {
+        if (id.tag() == .@"var") return;
+        const out = &self.nodes.items(.out)[id.index];
 
         out.len += 1;
         switch (out.len) {
@@ -755,7 +751,7 @@ const Son = struct {
                 const view = self.out_slices.items[out.value.base..][0 .. out.len + 1];
                 const index = std.mem.indexOfScalar(u32, @ptrCast(view), @bitCast(from)).?;
                 if (out.len == 1)
-                    out.value = .{ .direct = view[index] }
+                    out.value = .{ .direct = view[1 - index] }
                 else
                     std.mem.swap(Id, &view[index], &view[out.len]);
             },
@@ -764,7 +760,7 @@ const Son = struct {
 };
 
 const Id = packed struct(u32) {
-    tagi: std.meta.Tag(Node.Kind) = 0,
+    tagi: std.meta.Tag(Node.Kind) = @intFromEnum(Node.Kind.@"var"),
     index: std.meta.Int(.unsigned, 32 - @bitSizeOf(Node.Kind)) = 0,
 
     fn init(kind: Node.Kind, index: usize) Id {
@@ -826,8 +822,6 @@ const Node = struct {
     const Type = enum {
         bottom,
         top,
-        CtrlTop,
-        CtrlBot,
         IntTop,
         Int,
         IntBot,
@@ -1019,7 +1013,7 @@ const Fmt = struct {
         }
         try self.out.append('\n');
 
-        const outs = self.son.outView(&self.son.nodes.items(.out)[id.index]);
+        const outs = self.son.outView(id);
         switch (id.tag()) {
             .start, .tuple, .@"if", .region => for (outs) |out| if (out.tag().isCfg()) try self.fmt(out),
             .@"const", .@"return", .@"var", .phi => {},
