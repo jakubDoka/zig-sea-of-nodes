@@ -852,7 +852,7 @@ const Node = struct {
 
         fn isTerminal(kind: Kind) bool {
             return switch (kind) {
-                .@"return" => true,
+                .@"return", .@"var" => true,
                 else => false,
             };
         }

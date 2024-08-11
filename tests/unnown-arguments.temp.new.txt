@@ -1,0 +1,95 @@
+CASE: return 1 + arg + 2;
+start0: 
+tuple1: start0.0
+tuple2: start0.1
+const6: 3
++5: tuple2, const6
+return4: tuple1 -> +5
+
+CASE: return (1 + arg) + 2;
+start0: 
+tuple1: start0.0
+tuple2: start0.1
+const6: 3
++5: tuple2, const6
+return4: tuple1 -> +5
+
+CASE: return 0 + arg;
+start0: 
+tuple1: start0.0
+tuple2: start0.1
+return4: tuple1 -> tuple2
+
+CASE: return arg + 0 + arg;
+start0: 
+tuple1: start0.0
+tuple2: start0.1
+const4: 2
+*5: tuple2, const4
+return6: tuple1 -> *5
+
+CASE: return 1 + arg + 2 + arg + 3;
+start0: 
+tuple1: start0.0
+tuple2: start0.1
+const4: 2
+*3: tuple2, const4
+const8: 6
++7: *3, const8
+return5: tuple1 -> +7
+
+CASE: return 1 * arg;
+start0: 
+tuple1: start0.0
+tuple2: start0.1
+return4: tuple1 -> tuple2
+
+CASE: return 3 == 3;
+start0: 
+tuple1: start0.0
+const4: 1
+return3: tuple1 -> const4
+tuple2: start0.1
+
+CASE: return 3 == 4;
+start0: 
+tuple1: start0.0
+const4: 0
+return3: tuple1 -> const4
+tuple2: start0.1
+
+CASE: return 3 != 3;
+start0: 
+tuple1: start0.0
+const4: 0
+return3: tuple1 -> const4
+tuple2: start0.1
+
+CASE: return 3 != 4;
+start0: 
+tuple1: start0.0
+const4: 1
+return3: tuple1 -> const4
+tuple2: start0.1
+
+CASE: a := arg+1; b := a; b = 1; return a + 2;
+start0: 
+tuple1: start0.0
+const6: 3
+return5: tuple1 -> const6
+tuple2: start0.1
+
+CASE: a := arg + 1; a = a; return a;
+start0: 
+tuple1: start0.0
+tuple2: start0.1
+const3: 1
++4: tuple2, const3
+return5: tuple1 -> +4
+
+CASE: return -arg;
+start0: 
+tuple1: start0.0
+tuple2: start0.1
+#-3: tuple2
+return4: tuple1 -> #-3
