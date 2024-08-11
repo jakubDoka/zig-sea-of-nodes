@@ -131,6 +131,8 @@ const Lexeme = enum(u8) {
     @"return",
     @"if",
     @"else",
+    true,
+    false,
     Int,
     Ident,
 
@@ -325,6 +327,8 @@ const Parser = struct {
                 .int = std.fmt.parseInt(i64, token.view(self.lexer.source), 10) catch
                     unreachable,
             }),
+            .true => return try self.alloc(.@"const", .{ .int = 1 }),
+            .false => return try self.alloc(.@"const", .{ .int = 0 }),
             .@"-" => return try self.alloc(.@"#-", try self.nextUnit()),
             .@"return" => {
                 const value = try self.nextExpr();
@@ -333,6 +337,7 @@ const Parser = struct {
                     .value = value,
                     .cfg = self.prev_cntrl,
                 });
+                self.prev_cntrl = return_node;
                 return return_node;
             },
             .@"if" => {
@@ -340,12 +345,17 @@ const Parser = struct {
                 defer self.branch_base = prev_branch_base;
                 self.branch_base = @intCast(self.vars.items.len);
 
-                const stmt = try self.alloc(.@"if", .{
-                    .cond = try self.nextExpr(),
-                    .cfg = self.prev_cntrl,
-                });
+                const cond = try self.nextExpr();
+                const cond_val = if (self.son.isConst(cond))
+                    self.son.nodes.items(.inputs)[cond.index].@"const".int
+                else
+                    null;
+                const stmt = try self.alloc(.@"if", .{ .cond = cond, .cfg = self.prev_cntrl });
 
-                self.prev_cntrl = try self.alloc(.tuple, .{ .on = stmt, .index = 0 });
+                self.prev_cntrl = try self.alloc(.tuple, Node.init(
+                    if (cond_val == 0) .CtrlTop else .CtrlBot,
+                    .{ .on = stmt, .index = 0 },
+                ));
                 var left_change_base = self.branch_changes.items.len;
                 _ = try self.nextExpr();
                 const lcfg = self.prev_cntrl;
@@ -357,7 +367,10 @@ const Parser = struct {
                     std.mem.swap(Id, &self.vars.items[change.variable].value, &change.value);
                 }
 
-                self.prev_cntrl = try self.alloc(.tuple, .{ .on = stmt, .index = 1 });
+                self.prev_cntrl = try self.alloc(.tuple, Node.init(
+                    if (cond_val == 1) .CtrlTop else .CtrlBot,
+                    .{ .on = stmt, .index = 1 },
+                ));
                 const right_change_base = self.branch_changes.items.len;
                 if (self.cur.lexeme == .@"else") {
                     _ = self.advance();
@@ -375,7 +388,6 @@ const Parser = struct {
                     std.mem.swap(Id, &self.vars.items[change.variable].value, &change.value);
                 }
                 self.prev_cntrl = try self.alloc(.region, .{ .lcfg = lcfg, .rcfg = rcfg });
-                if (self.branch_changes.items.len == 0) return .{};
 
                 var write = self.branch_changes.items.len;
                 var read = write;
@@ -404,6 +416,7 @@ const Parser = struct {
                     left_change_base += 1;
                 }
                 self.branch_changes.items.len = left_change_base;
+
                 return .{};
             },
             .Ident => for (self.vars.items) |variable| {
@@ -458,9 +471,19 @@ const Son = struct {
     }
 
     fn peephole(self: *Son, kind: Node.Kind, node: *Node.Inputs) std.mem.Allocator.Error!?Id {
-        var inputs = self.nodes.items(.inputs);
+        var inputs: []Node.Inputs = self.nodes.items(.inputs);
         switch (kind) {
             .phi => {
+                const region = inputs[node.phi.cfg.index].region;
+                if (region.lcfg.tag().isTerminal()) {
+                    self.freeId(node.phi.right, null);
+                    return node.phi.left;
+                }
+                if (region.rcfg.tag().isTerminal()) {
+                    self.freeId(node.phi.left, null);
+                    return node.phi.right;
+                }
+
                 if (node.phi.left.tagi == node.phi.right.tagi and node.phi.right.tag().isOp()) {
                     const left = inputs[node.phi.left.index].bin_op;
                     const right = inputs[node.phi.right.index].bin_op;
@@ -481,6 +504,46 @@ const Son = struct {
                         return fin;
                     }
                 }
+            },
+            inline .region, .@"if", .@"return", .tuple => |op| b: {
+                const types = self.nodes.items(.type);
+
+                var isDead = true;
+                comptime var reached = false;
+                switch (op) {
+                    .tuple => break :b,
+                    inline else => |t| c: {
+                        const name = comptime t.inputField();
+                        const payload = &@field(node, name);
+                        const Payload = @TypeOf(payload.*);
+                        if (@typeInfo(Payload) != .Struct) break :c;
+                        inline for (std.meta.fields(Payload)) |field| {
+                            if (comptime std.mem.indexOf(u8, field.name, "cfg") == null)
+                                continue;
+                            isDead = isDead and
+                                (types[@field(payload, field.name).index] == .CtrlTop or
+                                @field(payload, field.name).tag().isTerminal());
+                            reached = true;
+                        }
+                    },
+                }
+                comptime std.debug.assert(reached);
+                if (!isDead) break :b;
+
+                switch (op) {
+                    inline else => |t| c: {
+                        const name = comptime t.inputField();
+                        const payload = &@field(node, name);
+                        const Payload = @TypeOf(payload);
+                        if (@typeInfo(Payload) != .Struct) break :c;
+                        inline for (std.meta.fields(Payload)) |field| {
+                            self.freeId(@field(payload, field.name), null);
+                            @field(payload, field.name) = .{};
+                        }
+                    },
+                }
+
+                return try self.append(op, Node.init(.CtrlTop, node.*));
             },
             .@"#-" => if (self.isConst(node.un_op)) {
                 const oper = inputs[node.un_op.index].@"const".int;
@@ -611,9 +674,9 @@ const Son = struct {
     }
 
     fn alloc(self: *Son, kind: Node.Kind, anode: anytype) !Id {
-        var inputs = Node.init(.top, anode).inputs;
-        if (try self.peephole(kind, &inputs)) |id| return id;
-        const id = try self.append(kind, inputs);
+        var node = Node.init(.top, anode);
+        if (try self.peephole(kind, &node.inputs)) |id| return id;
+        const id = try self.append(kind, node);
         try self.forEachInput(id, outAppend);
         return id;
     }
@@ -763,6 +826,8 @@ const Node = struct {
     const Type = enum {
         bottom,
         top,
+        CtrlTop,
+        CtrlBot,
         IntTop,
         Int,
         IntBot,
@@ -784,6 +849,13 @@ const Node = struct {
         @"*",
         @"/",
         @"#-",
+
+        fn isTerminal(kind: Kind) bool {
+            return switch (kind) {
+                .@"return" => true,
+                else => false,
+            };
+        }
 
         fn inputField(kind: Kind) []const u8 {
             const name = @tagName(kind);
@@ -921,7 +993,10 @@ const Fmt = struct {
                     inputs.tuple.index,
                 });
             },
-            .@"var", .start, .region => {},
+            .@"var", .start => {},
+            .region => {
+                try self.out.writer().print("{}, {}", .{ inputs.region.lcfg, inputs.region.rcfg });
+            },
             .@"if" => {
                 try self.out.writer().print("{}, {}", .{ inputs.@"if".cond, inputs.@"if".cfg });
             },
@@ -1131,6 +1206,20 @@ test "if-statements" {
         \\    a = 4;
         \\else
         \\    a = 5;
+        \\return a;
+    });
+}
+
+test "if-statements-peephole" {
+    try dynCaseMany("if-statements-peephole", &.{
+        \\if true return 2;
+        \\return 1;
+        ,
+        \\a := 1;
+        \\if true
+        \\  a = 2;
+        \\else
+        \\  a = 3;
         \\return a;
     });
 }

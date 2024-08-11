@@ -11,7 +11,7 @@ const4: 1
 ==5: tuple2, const4
 if6: ==5, tuple1
 tuple7: if6.0
-region13: 
+region13: tuple7, tuple10
 const8: 2
 +9: tuple2, const8
 const11: 3
@@ -32,7 +32,7 @@ const5: 1
 ==6: tuple2, const5
 if7: ==6, tuple1
 tuple8: if7.0
-region12: 
+region12: tuple8, tuple11
 const3: 2
 const9: 3
 phi13: region12 ? const3 : const9
@@ -54,7 +54,7 @@ const5: 1
 ==6: tuple2, const5
 if7: ==6, tuple1
 tuple8: if7.0
-region12: 
+region12: tuple8, tuple11
 const3: 3
 const10: 4
 phi13: region12 ? const3 : const10
@@ -75,7 +75,7 @@ const7: 1
 ==8: tuple2, const7
 if9: ==8, tuple1
 tuple10: if9.0
-region18: 
+region18: tuple10, tuple15
 const5: 2
 +6: tuple2, const5
 const11: 2
@@ -113,8 +113,8 @@ const8: 2
 ==9: tuple2, const8
 if10: ==9, tuple7
 tuple11: if10.0
-region15: 
-region27: 
+region15: tuple11, tuple13
+region27: region15, region25
 const12: 2
 const14: 3
 phi16: region15 ? const12 : const14
@@ -129,5 +129,5 @@ const18: 3
 ==19: tuple2, const18
 if20: ==19, tuple17
 tuple21: if20.0
-region25: 
+region25: tuple21, tuple23
 tuple23: if20.1
