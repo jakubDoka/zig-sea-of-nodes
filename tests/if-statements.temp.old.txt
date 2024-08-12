@@ -33,9 +33,9 @@ const5: 1
 if7: ==6, tuple1
 tuple8: if7.0
 region12: tuple8, tuple11
-const3: 2
 const9: 3
-phi13: region12 ? const3 : const9
+const3: 2
+phi13: region12 ? const9 : const3
 ==14: tuple2, phi13
 return10: region12 -> ==14
 tuple11: if7.1
@@ -55,9 +55,9 @@ const5: 1
 if7: ==6, tuple1
 tuple8: if7.0
 region12: tuple8, tuple11
-const3: 3
 const10: 4
-phi13: region12 ? const3 : const10
+const3: 3
+phi13: region12 ? const10 : const3
 return15: region12 -> phi13
 tuple11: if7.1
 
@@ -76,13 +76,13 @@ const7: 1
 if9: ==8, tuple1
 tuple10: if9.0
 region18: tuple10, tuple15
-const5: 2
-+6: tuple2, const5
 const11: 2
 *12: tuple2, const11
 const14: 3
 +13: *12, const14
-phi16: region18 ? +6 : +13
+const5: 2
++6: tuple2, const5
+phi16: region18 ? +13 : +6
 const3: 1
 const17: 3
 phi19: region18 ? const3 : const17

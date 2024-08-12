@@ -2,10 +2,8 @@ CASE: if true return 2;
 return 1;
 start0: 
 tuple1: start0.0
-const3: 1
-if4: const3, tuple1
-const5: 2
-return6: tuple1 -> const5
+const3: 2
+return4: tuple1 -> const3
 tuple2: start0.1
 
 CASE: a := 1;
@@ -16,8 +14,30 @@ else
 return a;
 start0: 
 tuple1: start0.0
-const4: 1
-if5: const4, tuple1
-const6: 2
-return8: tuple1 -> const6
+const4: 2
+return6: tuple1 -> const4
 tuple2: start0.1
+
+CASE: a := 0;
+b := 1;
+if arg {
+    a = 2;
+    if arg b = 2;
+    else b = 3;
+}
+return a+b;
+start0: 
+tuple1: start0.0
+tuple2: start0.1
+if5: tuple2, tuple1
+tuple6: if5.0
+region9: tuple6, tuple10
+const7: 2
+const3: 0
+phi11: region9 ? const7 : const3
+const8: 2
+const4: 1
+phi12: region9 ? const8 : const4
++13: phi11, phi12
+return14: region9 -> +13
+tuple10: if5.1

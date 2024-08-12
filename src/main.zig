@@ -6,126 +6,6 @@ inline fn copy(value: anytype) @TypeOf(value) {
     return vl;
 }
 
-//const BraceFinder = struct {
-//    prefix: []const u8,
-//    aligned: []const Vec = &.{},
-//    suffix: []const u8 = &.{},
-//
-//    depth: usize = 1,
-//    escape: bool = false,
-//
-//    const vec_size = @min(std.simd.suggestVectorLength(u8) orelse 1, 64);
-//    const Vec = @Vector(vec_size, u8);
-//    const Mask = std.meta.Int(.unsigned, vec_size);
-//
-//    fn init(source: []const u8) BraceFinder {
-//        if (vec_size == 1) return .{ .prefix = source };
-//        const offset = std.mem.alignPointerOffset(source.ptr, @alignOf(Vec)) orelse
-//            return .{ .prefix = source };
-//        const simd_len = (source.len - offset) / vec_size;
-//        return .{
-//            .prefix = source[0..offset],
-//            .aligned = @as([*]const Vec, @alignCast(@ptrCast(source.ptr + offset)))[0..simd_len],
-//            .suffix = source[offset + simd_len * vec_size ..],
-//        };
-//    }
-//
-//    fn findClosing(self: *BraceFinder) ?usize {
-//        if (self.findClosingUnaligned(self.prefix)) |i| return i;
-//
-//        const obq: Vec = @splat('{');
-//        const cbq: Vec = @splat('}');
-//        const esq: Vec = @splat('\\');
-//
-//        var carry_escape: u32 = 1;
-//        for (self.aligned, 0..) |batch, i| {
-//            const escapes: Mask = @bitCast(batch != esq);
-//            const aligned_escapes = @shlWithOverflow(escapes, 1)[0] | carry_escape;
-//            carry_escape = escapes >> vec_size - 1;
-//
-//            const unescaped_opening_braces: Mask = @bitCast(batch == obq);
-//            const unescaped_closing_braces: Mask = @bitCast(batch == cbq);
-//
-//            var opening_braces = unescaped_opening_braces & aligned_escapes;
-//            var closing_braces = unescaped_closing_braces & aligned_escapes;
-//
-//            while (opening_braces != closing_braces) {
-//                self.depth -= @intFromBool(closing_braces != 0);
-//                if (self.depth == 0 and @ctz(opening_braces) > @ctz(closing_braces))
-//                    return i * vec_size + @ctz(closing_braces) + self.prefix.len;
-//                self.depth += @intFromBool(opening_braces != 0);
-//                opening_braces &= opening_braces -% 1;
-//                closing_braces &= closing_braces -% 1;
-//            }
-//        }
-//
-//        if (self.findClosingUnaligned(self.suffix)) |i|
-//            return i + self.prefix.len + self.aligned.len * vec_size;
-//        return null;
-//    }
-//
-//    fn findClosingUnaligned(self: *BraceFinder, src: []const u8) ?usize {
-//        var i: usize = 0;
-//        while (i < src.len) : (i += 1) {
-//            switch (src[i]) {
-//                '\\' => i += 1,
-//                '{' => self.depth += 1,
-//                '}' => {
-//                    self.depth -= 1;
-//                    if (self.depth == 0) return i;
-//                },
-//                else => {},
-//            }
-//        }
-//
-//        return null;
-//    }
-//};
-//
-//test {
-//    const iters = 100;
-//    const mult = 1;
-//    const source =
-//        \\
-//        \\    prefix: []const u8,
-//        \\    simd: []align(vec_size) const u8 = &.{},
-//        \\    suffix: []const u8 = &.{},
-//        \\
-//        \\    depth: usize = 0,
-//        \\    escape: bool = false,
-//        \\
-//        \\    const vec_size = std.simd.suggestVectorLength(u8);
-//        \\    const Vec = @Vector(vec_size, u8);
-//        \\
-//        \\    fn init(source: []const u8) BraceFinder {
-//        \\        const simd = std.mem.alignInSlice(source, @alignOf(Vec)) orelse
-//        \\            return .{ .prefix = source }; "\}"
-//        \\        return .{
-//        \\            .prefix = source[0 .. @intFromPtr(simd.ptr) - @intFromPtr(source.ptr)],
-//        \\            .simd = simd,
-//        \\        };
-//        \\    }
-//        \\}
-//    ** mult;
-//
-//    var simd_acc: u64 = 0;
-//    var normal_acc: u64 = 0;
-//
-//    for (0..iters) |_| {
-//        var now = try std.time.Timer.start();
-//        var bf = BraceFinder.init(source);
-//        const opos = bf.findClosingUnaligned(source);
-//        normal_acc += now.lap();
-//        bf = BraceFinder.init(source);
-//        const pos = bf.findClosing();
-//        simd_acc += now.lap();
-//        std.debug.assert(pos == opos);
-//    }
-//
-//    std.debug.print("simd   took {}ns\n", .{simd_acc / iters / mult});
-//    std.debug.print("noraml took {}ns\n", .{normal_acc / iters / mult});
-//}
-
 const Lexeme = enum(u8) {
     Eof = 0,
     @"return",
@@ -245,17 +125,26 @@ const Parser = struct {
     lexer: Lexer,
     cur: Token,
     vars: std.ArrayListUnmanaged(Variable) = .{},
-    branch_changes: std.ArrayListUnmanaged(OldState) = .{},
-    branch_base: u32 = 0,
     prev_cntrl: Id = undefined,
+    branch_changes: std.ArrayListUnmanaged(OldState) = .{},
+    branch_changes_base: u16 = 0,
+    branch_base: u16 = 0,
+    if_conds: std.ArrayListUnmanaged(Cond) = .{},
+
+    const Cond = struct {
+        value: Id,
+        inerred_value: u32,
+    };
 
     const Variable = packed struct(u64) {
-        offset: u32,
+        assigned: bool = false,
+        offset: u31,
         value: Id = undefined,
     };
 
-    const OldState = struct {
-        variable: u32,
+    const OldState = packed struct(u64) {
+        left: bool = false,
+        variable: u31,
         value: Id,
     };
 
@@ -268,7 +157,10 @@ const Parser = struct {
 
     fn deinit(self: *Parser) void {
         self.vars.deinit(self.son.gpa);
+        std.debug.assert(self.branch_changes.items.len == 0);
         self.branch_changes.deinit(self.son.gpa);
+        std.debug.assert(self.if_conds.items.len == 0);
+        self.if_conds.deinit(self.son.gpa);
     }
 
     fn next(self: *Parser) !?Id {
@@ -298,11 +190,14 @@ const Parser = struct {
                 },
                 .@"=" => for (self.vars.items, 0..) |*variable, i| {
                     if (std.meta.eql(variable.value, acc)) {
-                        if (i < self.branch_base)
-                            try self.branch_changes.append(self.son.gpa, .{
-                                .variable = @intCast(i),
-                                .value = variable.value,
-                            });
+                        if (i < self.branch_base) {
+                            for (self.branch_changes.items[self.branch_changes_base..]) |change| {
+                                if (change.variable == i) break;
+                            } else try self.branch_changes.append(
+                                self.son.gpa,
+                                .{ .variable = @intCast(i), .value = variable.value },
+                            );
+                        }
                         variable.value = rhs;
                         std.debug.assert(self.advance().lexeme == .@";");
                         return .{};
@@ -342,89 +237,101 @@ const Parser = struct {
             },
             .@"if" => {
                 const prev_branch_base = self.branch_base;
-                defer self.branch_base = prev_branch_base;
                 self.branch_base = @intCast(self.vars.items.len);
 
                 const cond = try self.nextExpr();
-                const cond_val = if (self.son.isConst(cond))
-                    self.son.nodes.items(.inputs)[cond.index].@"const".int
+                const cond_val = if (self.son.isConst(cond)) b: {
+                    defer self.son.freeId(cond, null);
+                    break :b self.son.nodes.items(.inputs)[cond.index].@"const".int;
+                } else for (self.if_conds.items) |cnd| {
+                    if (std.meta.eql(cnd.value, cond)) break @as(i64, cnd.inerred_value);
+                } else null;
+                try self.if_conds.append(self.son.gpa, .{ .value = cond, .inerred_value = 1 });
+
+                const stmt = if (cond_val == null)
+                    try self.alloc(.@"if", .{ .cond = cond, .cfg = self.prev_cntrl })
                 else
-                    null;
-                const stmt = try self.alloc(.@"if", .{ .cond = cond, .cfg = self.prev_cntrl });
+                    Id{};
 
                 self.prev_cntrl = if (cond_val == null)
                     try self.alloc(.tuple, .{ .on = stmt, .index = 0 })
                 else if (cond_val == 0) .{} else self.prev_cntrl;
+                const prev_branch_change_base = self.branch_changes_base;
                 var left_change_base = self.branch_changes.items.len;
+                self.branch_changes_base = @intCast(left_change_base);
                 _ = try self.nextExpr();
                 const lcfg = self.prev_cntrl;
 
-                var i = self.branch_changes.items.len;
-                while (i > left_change_base) {
-                    i -= 1;
-                    const change = &self.branch_changes.items[i];
+                for (self.branch_changes.items[left_change_base..]) |*change| {
+                    change.left = true;
                     std.mem.swap(Id, &self.vars.items[change.variable].value, &change.value);
                 }
 
+                self.if_conds.items[self.if_conds.items.len - 1].inerred_value = 0;
                 self.prev_cntrl = if (cond_val == null)
                     try self.alloc(.tuple, .{ .on = stmt, .index = 1 })
                 else if (cond_val != 0) .{} else self.prev_cntrl;
-                const right_change_base = self.branch_changes.items.len;
+                self.branch_changes_base = @intCast(self.branch_changes.items.len);
                 if (self.cur.lexeme == .@"else") {
                     _ = self.advance();
                     _ = try self.nextExpr();
                 }
                 const rcfg = self.prev_cntrl;
 
-                i = self.branch_changes.items.len;
-                while (i > right_change_base) {
-                    i -= 1;
-                    const change = &self.branch_changes.items[i];
-                    std.mem.swap(Id, &self.vars.items[change.variable].value, &change.value);
-                }
-                for (self.branch_changes.items[left_change_base..]) |*change| {
-                    std.mem.swap(Id, &self.vars.items[change.variable].value, &change.value);
-                }
                 const region = try self.alloc(.region, .{ .lcfg = lcfg, .rcfg = rcfg });
 
-                var write = self.branch_changes.items.len;
-                var read = write;
-                while (read > left_change_base) {
-                    read -= 1;
-                    var change = self.branch_changes.items[read];
-                    if (self.vars.items[change.variable].value.tag() == .@"var") continue;
-                    change.value = try self.alloc(.phi, if (read > right_change_base) .{
-                        .cfg = region,
-                        .left = self.vars.items[change.variable].value,
-                        .right = change.value,
-                    } else .{
+                const fns = struct {
+                    fn lessThen(_: void, lhs: OldState, rhs: OldState) bool {
+                        return lhs.variable < rhs.variable or (lhs.variable == rhs.variable and lhs.left);
+                    }
+                };
+                const changes = self.branch_changes.items[left_change_base..];
+                std.sort.pdq(OldState, changes, {}, fns.lessThen);
+
+                var i: usize = 0;
+                while (i < changes.len) {
+                    const change = changes[i];
+                    i += 1;
+                    const variable = &self.vars.items[change.variable];
+                    const phi = try self.alloc(.phi, .{
                         .cfg = region,
                         .left = change.value,
-                        .right = self.vars.items[change.variable].value,
+                        .right = variable.value,
                     });
-                    self.vars.items[change.variable].value = .{};
-                    write -= 1;
-                    self.branch_changes.items[write] = change;
-                }
-
-                for (self.branch_changes.items[write..]) |change| {
-                    std.debug.assert(std.meta.eql(self.vars.items[change.variable].value, .{}));
-                    self.vars.items[change.variable].value = change.value;
-                    self.branch_changes.items[left_change_base] = change;
-                    left_change_base += 1;
+                    if (!change.left) {
+                        variable.value = change.value;
+                    } else if (i < changes.len and changes[i].variable == change.variable) {
+                        variable.value = changes[i].value;
+                        i += 1;
+                    }
+                    if (change.variable < prev_branch_base) {
+                        self.branch_changes.items[left_change_base] = .{
+                            .variable = change.variable,
+                            .value = variable.value,
+                        };
+                        left_change_base += 1;
+                    }
+                    variable.value = phi;
                 }
                 self.branch_changes.items.len = left_change_base;
 
                 if (cond_val == null) self.prev_cntrl = region else {
                     self.prev_cntrl = if (cond_val == 0) rcfg else lcfg;
+                    std.debug.assert(self.prev_cntrl.tag() != .@"var");
+                    try self.son.outAppend(self.prev_cntrl, .{});
                     self.son.freeId(region, null);
+                    self.son.outRemove(self.prev_cntrl, .{});
                 }
+
+                _ = self.if_conds.pop();
+                self.branch_changes_base = prev_branch_change_base;
+                self.branch_base = prev_branch_base;
 
                 return .{};
             },
             .Ident => for (self.vars.items) |variable| {
                 const ident_str = token.view(self.lexer.source);
-                if (variable.offset == std.math.maxInt(u32) and
+                if (variable.offset == std.math.maxInt(u31) and
                     std.mem.eql(u8, "arg", ident_str))
                     return Id.init(.tuple, 2);
                 const name = Lexer.peekStr(self.lexer.source, variable.offset);
@@ -465,7 +372,7 @@ const Son = struct {
     gpa: std.mem.Allocator,
     nodes: std.MultiArrayList(Node) = .{},
     out_slices: std.ArrayListUnmanaged(Id) = .{},
-    free: u32 = std.math.maxInt(u32),
+    free: u32 = 0,
 
     fn deinit(self: *Son) void {
         self.nodes.deinit(self.gpa);
@@ -551,6 +458,12 @@ const Son = struct {
                 return try self.append(.@"const", .{ .int = -oper });
             },
             inline .@"+", .@"*", .@"/", .@"-", .@"==", .@"!=" => |op| {
+                // TODO:
+                //if (node.bin_op.lhs.tag() == .phi and node.bin_op.rhs.tag() == .phi) {
+                //    const lhs = inputs[node.bin_op.lhs.index].@"const".int;
+                //    const rhs = inputs[node.bin_op.rhs.index].@"const".int;
+                //}
+
                 if (self.isConst(node.bin_op.lhs) and self.isConst(node.bin_op.rhs)) {
                     const lhs = inputs[node.bin_op.lhs.index].@"const".int;
                     const rhs = inputs[node.bin_op.rhs.index].@"const".int;
@@ -652,8 +565,8 @@ const Son = struct {
     }
 
     fn append(self: *Son, kind: Node.Kind, inputs: anytype) !Id {
-        if (self.free != std.math.maxInt(u32)) {
-            const id = self.free;
+        if (self.free != 0) {
+            const id = -%self.free;
             self.free = self.nodes.items(.out)[id].len;
             self.nodes.set(id, Node.init(.top, inputs));
             std.debug.assert(self.nodes.items(.out)[id].len == 0);
@@ -673,7 +586,7 @@ const Son = struct {
         self.forEachInput(id, freeId) catch {};
         self.nodes.set(id.index, undefined);
         self.nodes.items(.out)[id.index].len = self.free;
-        self.free = id.index;
+        self.free = -%@as(u32, id.index);
     }
 
     fn alloc(self: *Son, kind: Node.Kind, anode: anytype) !Id {
@@ -733,6 +646,7 @@ const Son = struct {
                 try self.out_slices.appendSlice(self.gpa, &data);
             },
             else => {
+                std.debug.assert(out.len < 10000);
                 try self.out_slices.ensureTotalCapacity(self.gpa, out.len + self.out_slices.items.len);
                 self.out_slices.appendSliceAssumeCapacity(self.out_slices.items[out.value.base..][0 .. out.len - 1]);
                 self.out_slices.appendAssumeCapacity(value);
@@ -742,6 +656,7 @@ const Son = struct {
     }
 
     fn outRemove(self: *Son, id: Id, from: Id) void {
+        if (id.tag() == .@"var") return;
         const out = &self.nodes.items(.out)[id.index];
 
         out.len -= 1;
@@ -760,8 +675,8 @@ const Son = struct {
 };
 
 const Id = packed struct(u32) {
-    tagi: std.meta.Tag(Node.Kind) = @intFromEnum(Node.Kind.@"var"),
     index: std.meta.Int(.unsigned, 32 - @bitSizeOf(Node.Kind)) = 0,
+    tagi: std.meta.Tag(Node.Kind) = @intFromEnum(Node.Kind.@"var"),
 
     fn init(kind: Node.Kind, index: usize) Id {
         return .{ .tagi = @intFromEnum(kind), .index = @intCast(index) };
@@ -900,7 +815,7 @@ const Node = struct {
     };
 
     const Out = struct {
-        value: union { direct: Id, base: u32 } = undefined,
+        value: union { direct: Id, base: u32 } = .{ .direct = undefined },
         len: u32 = 0,
     };
 
@@ -1031,7 +946,7 @@ fn parse(code: []const u8, son: *Son) !Id {
     defer parser.deinit();
     parser.prev_cntrl = try parser.alloc(.tuple, .{ .on = start, .index = 0 });
     try parser.vars.append(parser.son.gpa, .{
-        .offset = std.math.maxInt(u32),
+        .offset = std.math.maxInt(u31),
         .value = try parser.alloc(.tuple, Node.init(.IntBot, .{ .on = start, .index = 1 })),
     });
     var last_node = start;
@@ -1114,32 +1029,152 @@ pub fn runDiff(gpa: std.mem.Allocator, old: []const u8, new: []const u8) !void {
     try std.testing.expectEqual(0, exit);
 }
 
-//test "arithmetic" {
-//    try constCase(2, "return 1 + 2 * 3 + -5;");
-//}
+//const BraceFinder = struct {
+//    prefix: []const u8,
+//    aligned: []const Vec = &.{},
+//    suffix: []const u8 = &.{},
 //
-//test "variables-0" {
-//    try constCase(4,
-//        \\a := 1;
-//        \\b := 2;
-//        \\c := 0;
-//        \\{
-//        \\    d := 3;
-//        \\    c = a + d;
+//    depth: usize = 1,
+//    escape: bool = false,
+//
+//    const vec_size = @min(std.simd.suggestVectorLength(u8) orelse 1, 64);
+//    const Vec = @Vector(vec_size, u8);
+//    const Mask = std.meta.Int(.unsigned, vec_size);
+//
+//    fn init(source: []const u8) BraceFinder {
+//        if (vec_size == 1) return .{ .prefix = source };
+//        const offset = std.mem.alignPointerOffset(source.ptr, @alignOf(Vec)) orelse
+//            return .{ .prefix = source };
+//        const simd_len = (source.len - offset) / vec_size;
+//        return .{
+//            .prefix = source[0..offset],
+//            .aligned = @as([*]const Vec, @alignCast(@ptrCast(source.ptr + offset)))[0..simd_len],
+//            .suffix = source[offset + simd_len * vec_size ..],
+//        };
+//    }
+//
+//    fn findClosing(self: *BraceFinder) ?usize {
+//        if (self.findClosingUnaligned(self.prefix)) |i| return i;
+//
+//        const obq: Vec = @splat('{');
+//        const cbq: Vec = @splat('}');
+//        const esq: Vec = @splat('\\');
+//
+//        var carry_escape: u32 = 1;
+//        for (self.aligned, 0..) |batch, i| {
+//            const escapes: Mask = @bitCast(batch != esq);
+//            const aligned_escapes = @shlWithOverflow(escapes, 1)[0] | carry_escape;
+//            carry_escape = escapes >> vec_size - 1;
+//
+//            const unescaped_opening_braces: Mask = @bitCast(batch == obq);
+//            const unescaped_closing_braces: Mask = @bitCast(batch == cbq);
+//
+//            var opening_braces = unescaped_opening_braces & aligned_escapes;
+//            var closing_braces = unescaped_closing_braces & aligned_escapes;
+//
+//            while (opening_braces != closing_braces) {
+//                self.depth -= @intFromBool(closing_braces != 0);
+//                if (self.depth == 0 and @ctz(opening_braces) > @ctz(closing_braces))
+//                    return i * vec_size + @ctz(closing_braces) + self.prefix.len;
+//                self.depth += @intFromBool(opening_braces != 0);
+//                opening_braces &= opening_braces -% 1;
+//                closing_braces &= closing_braces -% 1;
+//            }
+//        }
+//
+//        if (self.findClosingUnaligned(self.suffix)) |i|
+//            return i + self.prefix.len + self.aligned.len * vec_size;
+//        return null;
+//    }
+//
+//    fn findClosingUnaligned(self: *BraceFinder, src: []const u8) ?usize {
+//        var i: usize = 0;
+//        while (i < src.len) : (i += 1) {
+//            switch (src[i]) {
+//                '\\' => i += 1,
+//                '{' => self.depth += 1,
+//                '}' => {
+//                    self.depth -= 1;
+//                    if (self.depth == 0) return i;
+//                },
+//                else => {},
+//            }
+//        }
+//
+//        return null;
+//    }
+//};
+//
+//test {
+//    const iters = 100;
+//    const mult = 1;
+//    const source =
+//        \\
+//        \\    prefix: []const u8,
+//        \\    simd: []align(vec_size) const u8 = &.{},
+//        \\    suffix: []const u8 = &.{},
+//        \\
+//        \\    depth: usize = 0,
+//        \\    escape: bool = false,
+//        \\
+//        \\    const vec_size = std.simd.suggestVectorLength(u8);
+//        \\    const Vec = @Vector(vec_size, u8);
+//        \\
+//        \\    fn init(source: []const u8) BraceFinder {
+//        \\        const simd = std.mem.alignInSlice(source, @alignOf(Vec)) orelse
+//        \\            return .{ .prefix = source }; "\}"
+//        \\        return .{
+//        \\            .prefix = source[0 .. @intFromPtr(simd.ptr) - @intFromPtr(source.ptr)],
+//        \\            .simd = simd,
+//        \\        };
+//        \\    }
 //        \\}
-//        \\return c;
-//    );
-//}
+//    ** mult;
 //
-//test "variables-1" {
-//    try constCase(8,
-//        \\x0 := 1;
-//        \\y0 := 2;
-//        \\x1 := 3;
-//        \\y1 := 4;
-//        \\return (x0 - x1)*(x0 - x1) + (y0 - y1)*(y0 - y1);
-//    );
+//    var simd_acc: u64 = 0;
+//    var normal_acc: u64 = 0;
+//
+//    for (0..iters) |_| {
+//        var now = try std.time.Timer.start();
+//        var bf = BraceFinder.init(source);
+//        const opos = bf.findClosingUnaligned(source);
+//        normal_acc += now.lap();
+//        bf = BraceFinder.init(source);
+//        const pos = bf.findClosing();
+//        simd_acc += now.lap();
+//        std.debug.assert(pos == opos);
+//    }
+//
+//    std.debug.print("simd   took {}ns\n", .{simd_acc / iters / mult});
+//    std.debug.print("noraml took {}ns\n", .{normal_acc / iters / mult});
 //}
+
+test "arithmetic" {
+    try constCase(2, "return 1 + 2 * 3 + -5;");
+}
+
+test "variables-0" {
+    try constCase(4,
+        \\a := 1;
+        \\b := 2;
+        \\c := 0;
+        \\{
+        \\    d := 3;
+        \\    c = a + d;
+        \\}
+        \\return c;
+    );
+}
+
+test "variables-1" {
+    try constCase(8,
+        \\x0 := 1;
+        \\y0 := 2;
+        \\x1 := 3;
+        \\y1 := 4;
+        \\return (x0 - x1)*(x0 - x1) + (y0 - y1)*(y0 - y1);
+    );
+}
 
 test "unnown-arguments" {
     try dynCaseMany("unnown-arguments", &.{
@@ -1215,5 +1250,14 @@ test "if-statements-peephole" {
         \\else
         \\  a = 3;
         \\return a;
+        ,
+        \\a := 0;
+        \\b := 1;
+        \\if arg {
+        \\    a = 2;
+        \\    if arg b = 2;
+        \\    else b = 3;
+        \\}
+        \\return a+b;
     });
 }
