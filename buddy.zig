@@ -14,7 +14,10 @@ pub fn BuddyAllocator(
             if (base_cap * @sizeOf(T) < @sizeOf(FreeHeader)) {
                 @compileError("the base cap is too small to fit the Allocator metadata, " ++
                     "the smalles possible valid base_cap_pow2 is " ++
-                    std.fmt.comptimePrint("{d}", .{std.math.log2_int_ceil(usize, @max(@sizeOf(FreeHeader) / @sizeOf(T), 1))}));
+                    std.fmt.comptimePrint(
+                    "{d}",
+                    .{std.math.log2_int_ceil(usize, @max(@sizeOf(FreeHeader) / @sizeOf(T), 1))},
+                ));
             }
         }
 
@@ -99,6 +102,19 @@ pub fn BuddyAllocator(
             return allc;
         }
 
+        pub fn shrink(self: *Self, idx: Index, size: Size) void {
+            self.free(idx + size / 2, size / 2);
+        }
+
+        pub fn grow(self: *Self, idx: Index, size: Size) bool {
+            const sclass = sclassOf(size);
+            const buddyPos = buddyPosOf(idx, sclass);
+            if (buddyPos < idx or buddyPos > self.mem.len) return false;
+            const header = self.getHeader(buddyPos) orelse return false;
+            self.removeHeader(header, sclass);
+            return true;
+        }
+
         pub fn free(self: *Self, idx: Index, size: Size) void {
             var curIdx = idx;
             var sclass = sclassOf(size);
@@ -107,14 +123,7 @@ pub fn BuddyAllocator(
                 if (buddyPos >= self.mem.len) break;
                 std.debug.assert(buddyPos < self.mem.len);
                 if (self.getHeader(buddyPos)) |buddy| {
-                    if (buddy.prev != index_sentinel) {
-                        self.getHeader(buddy.prev).?.next = buddy.next;
-                    }
-                    if (buddy.next != index_sentinel) {
-                        self.getHeader(buddy.next).?.prev = buddy.prev;
-                    } else {
-                        self.sclasses[sclass] = buddy.prev;
-                    }
+                    self.removeHeader(buddy, sclass);
                 } else break;
                 curIdx = @min(buddyPos, curIdx);
                 sclass += 1;
@@ -124,6 +133,17 @@ pub fn BuddyAllocator(
                 .prev = self.sclasses[sclass],
             };
             self.sclasses[sclass] = curIdx;
+        }
+
+        fn removeHeader(self: *Self, header: *FreeHeader, sclass: SClass) void {
+            if (header.prev != index_sentinel) {
+                self.getHeader(header.prev).?.next = header.next;
+            }
+            if (header.next != index_sentinel) {
+                self.getHeader(header.next).?.prev = header.prev;
+            } else {
+                self.sclasses[sclass] = header.prev;
+            }
         }
 
         fn getHeader(self: *Self, pos: usize) ?*FreeHeader {
