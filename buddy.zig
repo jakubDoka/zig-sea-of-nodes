@@ -8,7 +8,7 @@ pub fn BuddyAllocator(
 ) type {
     return struct {
         mem: []align(@alignOf(FreeHeader)) T = &.{},
-        sclasses: [sclass_count]u32 = [_]u32{index_sentinel} ** sclass_count,
+        sclasses: [sclass_count]Index = [_]Index{index_sentinel} ** sclass_count,
 
         comptime {
             if (base_cap * @sizeOf(T) < @sizeOf(FreeHeader)) {
@@ -23,7 +23,7 @@ pub fn BuddyAllocator(
 
         const Self = @This();
         pub const SClass = std.meta.Int(.unsigned, std.math.log2_int_ceil(u16, sclass_count));
-        pub const Index = u32;
+        pub const Index = Size;
         pub const Size = std.meta.Int(.unsigned, max_cap_pow2);
 
         pub const index_sentinel = std.math.maxInt(Index);
@@ -50,7 +50,7 @@ pub fn BuddyAllocator(
             self.* = undefined;
         }
 
-        pub fn alloc(self: *Self, gpa: std.mem.Allocator, size: Size) !u32 {
+        pub fn alloc(self: *Self, gpa: std.mem.Allocator, size: Size) !Index {
             std.debug.assert(std.math.isPowerOfTwo(size));
             std.debug.assert(size >= 1 << base_cap_pow2);
 
@@ -91,11 +91,11 @@ pub fn BuddyAllocator(
             }
             header.sentinel = uninit;
 
-            var cursor = allc + size;
+            var cursor = allc +% size;
             var step = size;
             for (sclass..alloc_sclass) |_| {
                 self.free(cursor, step);
-                cursor += step;
+                cursor +%= step;
                 step *%= 2;
             }
 
@@ -163,10 +163,10 @@ pub fn BuddyAllocator(
             return std.meta.eql(value, sentinel);
         }
 
-        fn buddyPosOf(idx: Index, sclass: SClass) Index {
+        fn buddyPosOf(idx: Index, sclass: SClass) usize {
             const sclss = sclass + base_cap_pow2;
-            std.debug.assert(idx & ((@as(Index, 1) << sclss) - 1) == 0);
-            return idx ^ (@as(Index, 1) << sclss);
+            std.debug.assert(idx & ((@as(usize, 1) << sclss) -% 1) == 0);
+            return idx ^ (@as(usize, 1) << sclss);
         }
 
         fn sclassOf(size: Size) SClass {
@@ -197,7 +197,7 @@ pub fn BuddyAllocator(
 test {
     const gpa = std.testing.allocator;
 
-    const Bdy = BuddyAllocator(struct { u8, u16 }, .{ 0, 0 }, 10, 2);
+    const Bdy = BuddyAllocator(struct { u8, u16 }, .{ 0, 0 }, 10, 1);
     var buddy = Bdy{};
     defer buddy.deinit(gpa);
 
@@ -205,7 +205,7 @@ test {
     buddy.free(idx, 32);
 
     inline for (.{ 4, 16, 64, 256 }) |size| {
-        var idxs: [4]u32 = undefined;
+        var idxs: [4]Bdy.Index = undefined;
         for (&idxs) |*id| id.* = try buddy.alloc(gpa, size);
         for (idxs) |id| buddy.free(id, size);
     }
