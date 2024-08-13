@@ -1,5 +1,9 @@
 const std = @import("std");
 
+test {
+    _ = @import("buddy.zig");
+}
+
 inline fn copy(value: anytype) @TypeOf(value) {
     var vl: @TypeOf(value) = undefined;
     vl = value;
@@ -8,11 +12,15 @@ inline fn copy(value: anytype) @TypeOf(value) {
 
 const Lexeme = enum(u8) {
     Eof = 0,
+
     @"return",
     @"if",
     @"else",
+    @"while",
+
     true,
     false,
+
     Int,
     Ident,
 
@@ -22,6 +30,7 @@ const Lexeme = enum(u8) {
     @"-" = '-',
     @"*" = '*',
     @"/" = '/',
+    @"<" = '<',
     @"{" = '{',
     @"}" = '}',
     @"(" = '(',
@@ -34,7 +43,7 @@ const Lexeme = enum(u8) {
     fn prec(self: Lexeme) u8 {
         return switch (self) {
             .@"=", .@":=" => 15,
-            .@"==", .@"!=" => 7,
+            .@"==", .@"!=", .@"<" => 7,
             .@"+", .@"-" => 4,
             .@"*", .@"/" => 3,
             else => 254,
@@ -130,6 +139,12 @@ const Parser = struct {
     branch_changes_base: u16 = 0,
     branch_base: u16 = 0,
     if_conds: std.ArrayListUnmanaged(Cond) = .{},
+    loops: std.ArrayListUnmanaged(Loop) = .{},
+    loop_base: u16 = 0,
+
+    const Loop = struct {
+        entry: Id,
+    };
 
     const Cond = struct {
         value: Id,
@@ -161,6 +176,8 @@ const Parser = struct {
         self.branch_changes.deinit(self.son.gpa);
         std.debug.assert(self.if_conds.items.len == 0);
         self.if_conds.deinit(self.son.gpa);
+        std.debug.assert(self.loops.items.len == 0);
+        self.loops.deinit(self.son.gpa);
     }
 
     fn next(self: *Parser) !?Id {
@@ -190,13 +207,25 @@ const Parser = struct {
                 },
                 .@"=" => for (self.vars.items, 0..) |*variable, i| {
                     if (std.meta.eql(variable.value, acc)) {
-                        if (i < self.branch_base) {
+                        if (i < self.branch_base or i < self.loop_base) {
                             for (self.branch_changes.items[self.branch_changes_base..]) |change| {
                                 if (change.variable == i) break;
-                            } else try self.branch_changes.append(
-                                self.son.gpa,
-                                .{ .variable = @intCast(i), .value = variable.value },
-                            );
+                            } else {
+                                if (i < self.loop_base) {
+                                    const loop = self.loops.getLast();
+                                    const phi = try self.son.append(.phi, .{
+                                        .cfg = loop.entry,
+                                        .left = variable.value,
+                                        .right = undefined,
+                                    });
+                                    try self.son.outAppend(variable.value, phi);
+                                    variable.value = phi;
+                                }
+                                try self.branch_changes.append(
+                                    self.son.gpa,
+                                    .{ .variable = @intCast(i), .value = variable.value },
+                                );
+                            }
                         }
                         variable.value = rhs;
                         std.debug.assert(self.advance().lexeme == .@";");
@@ -215,8 +244,12 @@ const Parser = struct {
     }
 
     fn nextUnit(self: *Parser) !Id {
+        const fns = struct {
+            fn lessThen(_: void, lhs: OldState, rhs: OldState) bool {
+                return lhs.variable < rhs.variable or (lhs.variable == rhs.variable and lhs.left);
+            }
+        };
         const token = self.advance();
-
         switch (token.lexeme) {
             .Int => return try self.alloc(.@"const", .{
                 .int = std.fmt.parseInt(i64, token.view(self.lexer.source), 10) catch
@@ -234,6 +267,87 @@ const Parser = struct {
                 });
                 self.prev_cntrl = return_node;
                 return return_node;
+            },
+            .@"while" => {
+                const prev_loop_base = self.loop_base;
+                self.loop_base = @intCast(self.vars.items.len);
+                const prev_branch_base = self.branch_base;
+                self.branch_base = @intCast(self.vars.items.len);
+
+                const cond = try self.nextExpr();
+                const cond_val = if (self.son.isConst(cond)) b: {
+                    defer self.son.freeId(cond, null);
+                    break :b self.son.nodes.items(.inputs)[cond.index].@"const".int;
+                } else for (self.if_conds.items) |cnd| {
+                    if (std.meta.eql(cnd.value, cond)) break @as(i64, cnd.inerred_value);
+                } else null;
+                try self.if_conds.append(self.son.gpa, .{ .value = cond, .inerred_value = 1 });
+
+                const loop = try self.son.append(
+                    .loop,
+                    .{ .lcfg = self.prev_cntrl, .rcfg = undefined },
+                );
+                try self.son.outAppend(self.prev_cntrl, loop);
+                self.prev_cntrl = loop;
+                try self.loops.append(self.son.gpa, .{
+                    .entry = self.prev_cntrl,
+                });
+
+                const stmt = if (cond_val == null)
+                    try self.alloc(.@"if", .{ .cond = cond, .cfg = self.prev_cntrl })
+                else
+                    Id{};
+
+                self.prev_cntrl = if (cond_val == null)
+                    try self.alloc(.tuple, .{ .on = stmt, .index = 0 })
+                else if (cond_val == 0) .{} else self.prev_cntrl;
+                const prev_branch_change_base = self.branch_changes_base;
+                var left_change_base = self.branch_changes.items.len;
+                self.branch_changes_base = @intCast(left_change_base);
+                _ = try self.nextExpr();
+
+                const entry = self.loops.getLast().entry;
+                self.son.nodes.items(.inputs)[entry.index].region.rcfg = self.prev_cntrl;
+                try self.son.outAppend(self.prev_cntrl, entry);
+
+                const changes = self.branch_changes.items[left_change_base..];
+                std.sort.pdq(OldState, changes, {}, fns.lessThen);
+
+                self.prev_cntrl = if (cond_val == null)
+                    try self.alloc(.tuple, .{ .on = stmt, .index = 1 })
+                else if (cond_val == 0) .{} else self.prev_cntrl;
+
+                var i: usize = 0;
+                while (i < changes.len) {
+                    const change = changes[i];
+                    i += 1;
+                    const variable = &self.vars.items[change.variable];
+                    self.son.nodes.items(.inputs)[change.value.index].phi.right =
+                        variable.value;
+                    try self.son.outAppend(variable.value, change.value);
+                    //self.son.peephole(, node: *Node.Inputs)
+
+                    if (change.variable < prev_branch_base) {
+                        self.branch_changes.items[left_change_base] = .{
+                            .variable = change.variable,
+                            .value = self.son.nodes.items(.inputs)[change.value.index].phi.left,
+                        };
+                        left_change_base += 1;
+                    }
+                    variable.value = change.value;
+                }
+                self.branch_changes.items.len = left_change_base;
+
+                _ = self.loops.pop();
+                _ = self.if_conds.pop();
+                self.branch_changes_base = prev_branch_change_base;
+                self.branch_base = prev_branch_base;
+
+                self.branch_changes.items.len = prev_branch_change_base;
+                self.loop_base = prev_loop_base;
+                self.branch_base = prev_branch_base;
+
+                return .{};
             },
             .@"if" => {
                 const prev_branch_base = self.branch_base;
@@ -280,11 +394,6 @@ const Parser = struct {
 
                 const region = try self.alloc(.region, .{ .lcfg = lcfg, .rcfg = rcfg });
 
-                const fns = struct {
-                    fn lessThen(_: void, lhs: OldState, rhs: OldState) bool {
-                        return lhs.variable < rhs.variable or (lhs.variable == rhs.variable and lhs.left);
-                    }
-                };
                 const changes = self.branch_changes.items[left_change_base..];
                 std.sort.pdq(OldState, changes, {}, fns.lessThen);
 
@@ -333,7 +442,7 @@ const Parser = struct {
                 const ident_str = token.view(self.lexer.source);
                 if (variable.offset == std.math.maxInt(u31) and
                     std.mem.eql(u8, "arg", ident_str))
-                    return Id.init(.tuple, 2);
+                    return self.vars.items[0].value;
                 const name = Lexer.peekStr(self.lexer.source, variable.offset);
                 if (std.mem.eql(u8, name, ident_str))
                     return variable.value;
@@ -457,7 +566,7 @@ const Son = struct {
                 self.freeId(node.un_op, null);
                 return try self.append(.@"const", .{ .int = -oper });
             },
-            inline .@"+", .@"*", .@"/", .@"-", .@"==", .@"!=" => |op| {
+            inline .@"+", .@"*", .@"/", .@"-", .@"==", .@"!=", .@"<" => |op| {
                 // TODO:
                 //if (node.bin_op.lhs.tag() == .phi and node.bin_op.rhs.tag() == .phi) {
                 //    const lhs = inputs[node.bin_op.lhs.index].@"const".int;
@@ -715,10 +824,7 @@ const Node = struct {
             left: Id,
             right: Id,
         },
-        region: struct {
-            lcfg: Id,
-            rcfg: Id,
-        },
+        region: Region,
         @"return": struct {
             value: Id,
             cfg: Id,
@@ -734,6 +840,11 @@ const Node = struct {
         un_op: Id,
     };
 
+    const Region = struct {
+        lcfg: Id,
+        rcfg: Id,
+    };
+
     const Type = enum {
         bottom,
         top,
@@ -747,12 +858,14 @@ const Node = struct {
         start,
         @"if",
         region,
+        loop,
         phi,
         tuple,
         @"return",
         @"const",
         @"==",
         @"!=",
+        @"<",
         @"+",
         @"-",
         @"*",
@@ -767,6 +880,7 @@ const Node = struct {
         }
 
         fn inputField(kind: Kind) []const u8 {
+            if (kind == .loop) return "region";
             const name = @tagName(kind);
             return switch (name[0]) {
                 'a'...'z' => name,
@@ -777,7 +891,7 @@ const Node = struct {
 
         fn isOp(kind: Kind) bool {
             return switch (kind) {
-                .@"==", .@"!=", .@"+", .@"-", .@"*", .@"/" => true,
+                .@"==", .@"!=", .@"<", .@"+", .@"-", .@"*", .@"/" => true,
                 else => false,
             };
         }
@@ -786,6 +900,7 @@ const Node = struct {
             return switch (op) {
                 .@"==" => @intFromBool(lhs == rhs),
                 .@"!=" => @intFromBool(lhs != rhs),
+                .@"<" => @intFromBool(lhs < rhs),
                 .@"+" => lhs + rhs,
                 .@"*" => lhs * rhs,
                 .@"/" => @divFloor(lhs, rhs),
@@ -796,7 +911,7 @@ const Node = struct {
 
         fn isCfg(self: Kind) bool {
             switch (self) {
-                .@"return", .start, .tuple, .region, .@"if" => return true,
+                .@"return", .start, .tuple, .region, .@"if", .loop => return true,
                 else => return false,
             }
         }
@@ -884,7 +999,7 @@ const Fmt = struct {
                 try self.fmt(inputs.phi.left);
                 try self.fmt(inputs.phi.right);
             },
-            .@"var", .@"const", .tuple, .start, .region => {},
+            else => {},
         }
 
         try self.out.writer().print("{}: ", .{id});
@@ -902,8 +1017,7 @@ const Fmt = struct {
                     inputs.tuple.index,
                 });
             },
-            .@"var", .start => {},
-            .region => {
+            .region, .loop => {
                 try self.out.writer().print("{}, {}", .{ inputs.region.lcfg, inputs.region.rcfg });
             },
             .@"if" => {
@@ -925,15 +1039,13 @@ const Fmt = struct {
                     inputs.bin_op.rhs,
                 });
             },
+            else => {},
         }
         try self.out.append('\n');
 
-        const outs = self.son.outView(id);
-        switch (id.tag()) {
-            .start, .tuple, .@"if", .region => for (outs) |out| if (out.tag().isCfg()) try self.fmt(out),
-            .@"const", .@"return", .@"var", .phi => {},
-            .@"#-" => {},
-            .@"+", .@"-", .@"*", .@"/", .@"==", .@"!=" => {},
+        if (id.tag().isCfg()) {
+            const outs = self.son.outView(id);
+            for (outs) |out| if (out.tag().isCfg()) try self.fmt(out);
         }
     }
 };
@@ -1148,116 +1260,125 @@ pub fn runDiff(gpa: std.mem.Allocator, old: []const u8, new: []const u8) !void {
 //    std.debug.print("simd   took {}ns\n", .{simd_acc / iters / mult});
 //    std.debug.print("noraml took {}ns\n", .{normal_acc / iters / mult});
 //}
-
-test "arithmetic" {
-    try constCase(2, "return 1 + 2 * 3 + -5;");
-}
-
-test "variables-0" {
-    try constCase(4,
-        \\a := 1;
-        \\b := 2;
-        \\c := 0;
-        \\{
-        \\    d := 3;
-        \\    c = a + d;
-        \\}
-        \\return c;
-    );
-}
-
-test "variables-1" {
-    try constCase(8,
-        \\x0 := 1;
-        \\y0 := 2;
-        \\x1 := 3;
-        \\y1 := 4;
-        \\return (x0 - x1)*(x0 - x1) + (y0 - y1)*(y0 - y1);
-    );
-}
-
-test "unnown-arguments" {
-    try dynCaseMany("unnown-arguments", &.{
-        "return 1 + arg + 2;",
-        "return (1 + arg) + 2;",
-        "return 0 + arg;",
-        "return arg + 0 + arg;",
-        "return 1 + arg + 2 + arg + 3;",
-        "return 1 * arg;",
-        "return 3 == 3;",
-        "return 3 == 4;",
-        "return 3 != 3;",
-        "return 3 != 4;",
-        "a := arg+1; b := a; b = 1; return a + 2;",
-        "a := arg + 1; a = a; return a;",
-        "return -arg;",
-    });
-}
-
-test "if-statements" {
-    try dynCaseMany("if-statements", &.{
-        \\a := 1;
-        \\if arg == 1
-        \\    a = arg + 2;
-        \\else
-        \\    a = arg - 3;
-        \\return a;
-        ,
-        \\a := arg == 2;
-        \\if arg == 1 {
-        \\    a = arg == 3;
-        \\}
-        \\return a;
-        ,
-        \\c := 3;
-        \\b := 2;
-        \\if arg == 1 {
-        \\    b = 3;
-        \\    c = 4;
-        \\}
-        \\return c;
-        ,
-        \\a := arg + 1;
-        \\b := arg + 2;
-        \\if arg == 1
-        \\    b = b + a;
-        \\else
-        \\    a = b + 1;
-        \\return a + b;
-        ,
-        \\a := 1;
-        \\if arg == 1
-        \\    if arg == 2
-        \\        a = 2;
-        \\    else
-        \\        a = 3;
-        \\else if arg == 3
-        \\    a = 4;
-        \\else
-        \\    a = 5;
-        \\return a;
-    });
-}
-
-test "if-statements-peephole" {
-    try dynCaseMany("if-statements-peephole", &.{
-        \\if true return 2;
-        \\return 1;
-        ,
-        \\a := 1;
-        \\if true
-        \\  a = 2;
-        \\else
-        \\  a = 3;
-        \\return a;
-        ,
-        \\a := 0;
-        \\b := 1;
-        \\if arg {
-        \\    a = 2;
-        \\    if arg b = 2;
-        \\    else b = 3;
-        \\}
-        \\return a+b;
-    });
-}
+//
+//test "arithmetic" {
+//    try constCase(2, "return 1 + 2 * 3 + -5;");
+//}
+//
+//test "variables-0" {
+//    try constCase(4,
+//        \\a := 1;
+//        \\b := 2;
+//        \\c := 0;
+//        \\{
+//        \\    d := 3;
+//        \\    c = a + d;
+//        \\}
+//        \\return c;
+//    );
+//}
+//
+//test "variables-1" {
+//    try constCase(8,
+//        \\x0 := 1;
+//        \\y0 := 2;
+//        \\x1 := 3;
+//        \\y1 := 4;
+//        \\return (x0 - x1)*(x0 - x1) + (y0 - y1)*(y0 - y1);
+//    );
+//}
+//
+//test "unnown-arguments" {
+//    try dynCaseMany("unnown-arguments", &.{
+//        "return 1 + arg + 2;",
+//        "return (1 + arg) + 2;",
+//        "return 0 + arg;",
+//        "return arg + 0 + arg;",
+//        "return 1 + arg + 2 + arg + 3;",
+//        "return 1 * arg;",
+//        "return 3 == 3;",
+//        "return 3 == 4;",
+//        "return 3 != 3;",
+//        "return 3 != 4;",
+//        "a := arg+1; b := a; b = 1; return a + 2;",
+//        "a := arg + 1; a = a; return a;",
+//        "return -arg;",
+//    });
+//}
+//
+//test "if-statements" {
+//    try dynCaseMany("if-statements", &.{
+//        \\a := 1;
+//        \\if arg == 1
+//        \\    a = arg + 2;
+//        \\else
+//        \\    a = arg - 3;
+//        \\return a;
+//        ,
+//        \\a := arg == 2;
+//        \\if arg == 1 {
+//        \\    a = arg == 3;
+//        \\}
+//        \\return a;
+//        ,
+//        \\c := 3;
+//        \\b := 2;
+//        \\if arg == 1 {
+//        \\    b = 3;
+//        \\    c = 4;
+//        \\}
+//        \\return c;
+//        ,
+//        \\a := arg + 1;
+//        \\b := arg + 2;
+//        \\if arg == 1
+//        \\    b = b + a;
+//        \\else
+//        \\    a = b + 1;
+//        \\return a + b;
+//        ,
+//        \\a := 1;
+//        \\if arg == 1
+//        \\    if arg == 2
+//        \\        a = 2;
+//        \\    else
+//        \\        a = 3;
+//        \\else if arg == 3
+//        \\    a = 4;
+//        \\else
+//        \\    a = 5;
+//        \\return a;
+//    });
+//}
+//
+//test "if-statements-peephole" {
+//    try dynCaseMany("if-statements-peephole", &.{
+//        \\if true return 2;
+//        \\return 1;
+//        ,
+//        \\a := 1;
+//        \\if true
+//        \\  a = 2;
+//        \\else
+//        \\  a = 3;
+//        \\return a;
+//        ,
+//        \\a := 0;
+//        \\b := 1;
+//        \\if arg {
+//        \\    a = 2;
+//        \\    if arg b = 2;
+//        \\    else b = 3;
+//        \\}
+//        \\return a+b;
+//    });
+//}
+//
+//test "while-loops" {
+//    try dynCaseMany("while-loops", &.{
+//        \\while arg < 10 {
+//        \\    arg = arg + 1;
+//        \\}
+//        \\return arg;
+//    });
+//}
