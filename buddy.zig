@@ -169,12 +169,16 @@ pub fn BuddyAllocator(
             return idx ^ (@as(usize, 1) << sclss);
         }
 
-        fn sclassOf(size: Size) SClass {
+        pub fn sclassOf(size: Size) SClass {
             return @intCast(std.math.log2_int(Size, size) - base_cap_pow2);
         }
 
+        pub fn sizeOf(sclass: SClass) usize {
+            return @as(usize, 1) << (@as(u6, sclass) + base_cap_pow2);
+        }
+
         fn maxSclass(len: usize) SClass {
-            return sclassOf(@intCast(len / 2)) + 1;
+            return std.math.log2_int(Size, @intCast(len / 2)) + 1 - base_cap_pow2;
         }
 
         fn invertBits(value: anytype) @TypeOf(value) {

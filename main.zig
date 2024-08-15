@@ -1,140 +1,25 @@
 const std = @import("std");
+const Lexer = @import("Lexer.zig");
+const Token = Lexer.Token;
 
 test {
     _ = @import("buddy.zig");
+    _ = @import("Lexer.zig");
+    _ = @import("Son.zig");
+    _ = @import("Parser.zig");
 }
-
-inline fn copy(value: anytype) @TypeOf(value) {
-    var vl: @TypeOf(value) = undefined;
-    vl = value;
-    return vl;
-}
-
-const Lexeme = enum(u8) {
-    Eof = 0,
-
-    @"return",
-    @"if",
-    @"else",
-    @"while",
-
-    true,
-    false,
-
-    Int,
-    Ident,
-
-    @"=" = '=',
-    @";" = ';',
-    @"+" = '+',
-    @"-" = '-',
-    @"*" = '*',
-    @"/" = '/',
-    @"<" = '<',
-    @"{" = '{',
-    @"}" = '}',
-    @"(" = '(',
-    @")" = ')',
-
-    @":=" = ':' + 128,
-    @"==" = '=' + 128,
-    @"!=" = '!' + 128,
-
-    fn prec(self: Lexeme) u8 {
-        return switch (self) {
-            .@"=", .@":=" => 15,
-            .@"==", .@"!=", .@"<" => 7,
-            .@"+", .@"-" => 4,
-            .@"*", .@"/" => 3,
-            else => 254,
-        };
-    }
-};
-
-const Token = packed struct(u64) {
-    lexeme: Lexeme,
-    length: u24,
-    offset: u32,
-
-    fn view(self: Token, source: []const u8) []const u8 {
-        return source[self.offset..][0..self.length];
-    }
-};
 
 fn dbg(any: anytype) @TypeOf(any) {
     std.debug.print("{any}\n", .{any});
     return any;
 }
 
-const Lexer = struct {
-    source: []const u8,
-    index: usize = 0,
-
-    fn next(self: *Lexer) Token {
-        while (self.index < self.source.len) {
-            const start = self.index;
-            self.index += 1;
-            const lexeme: Lexeme = switch (self.source[start]) {
-                0...32 => continue,
-                'a'...'z', 'A'...'Z' => b: {
-                    while (self.index < self.source.len) switch (self.source[self.index]) {
-                        'a'...'z', 'A'...'Z', '0'...'9' => self.index += 1,
-                        else => break,
-                    };
-
-                    inline for (std.meta.fields(Lexeme)) |field| {
-                        if (comptime !std.ascii.isLower(field.name[0])) continue;
-                        if (std.mem.eql(u8, field.name, self.source[start..self.index]))
-                            break :b @enumFromInt(field.value);
-                    }
-
-                    break :b .Ident;
-                },
-                '0'...'9' => b: {
-                    while (self.index < self.source.len) switch (self.source[self.index]) {
-                        '0'...'9' => self.index += 1,
-                        else => break,
-                    };
-
-                    break :b .Int;
-                },
-                ':', '=', '!' => |c| @enumFromInt(c + @as(u8, 128) * @intFromBool(self.advanceIf('='))),
-                else => |c| @enumFromInt(c),
-            };
-            return .{
-                .lexeme = lexeme,
-                .length = @intCast(self.index - start),
-                .offset = @intCast(start),
-            };
-        }
-
-        return .{
-            .lexeme = .Eof,
-            .length = 0,
-            .offset = 0,
-        };
-    }
-
-    fn advanceIf(self: *Lexer, c: u8) bool {
-        if (self.index < self.source.len and self.source[self.index] == c) {
-            self.index += 1;
-            return true;
-        }
-        return false;
-    }
-
-    fn peekStr(source: []const u8, pos: usize) []const u8 {
-        var self = Lexer{ .source = source, .index = pos };
-        return self.next().view(source);
-    }
-};
-
 const Parser = struct {
     son: *Son,
     lexer: Lexer,
     cur: Token,
-    vars: std.ArrayListUnmanaged(Variable) = .{},
     prev_cntrl: Id = undefined,
+    vars: std.ArrayListUnmanaged(Variable) = .{},
     branch_changes: std.ArrayListUnmanaged(OldState) = .{},
     branch_changes_base: u16 = 0,
     branch_base: u16 = 0,
