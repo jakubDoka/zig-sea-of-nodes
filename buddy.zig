@@ -1,5 +1,10 @@
 const std = @import("std");
 
+fn dbg(any: anytype) @TypeOf(any) {
+    std.debug.print("{any}\n", .{any});
+    return any;
+}
+
 pub fn BuddyAllocator(
     comptime T: type,
     comptime sentinel: T,
@@ -82,14 +87,7 @@ pub fn BuddyAllocator(
 
             const allc = self.sclasses[alloc_sclass];
             const header = self.getHeader(allc).?;
-            std.debug.assert(header.next == index_sentinel);
-            self.sclasses[alloc_sclass] = header.prev;
-            if (header.prev != index_sentinel) {
-                const prev_header = self.getHeader(header.prev).?;
-                std.debug.assert(prev_header.next == allc);
-                prev_header.next = index_sentinel;
-            }
-            header.sentinel = uninit;
+            self.removeHeader(header, alloc_sclass);
 
             var cursor = allc +% size;
             var step = size;
@@ -132,18 +130,27 @@ pub fn BuddyAllocator(
                 .next = index_sentinel,
                 .prev = self.sclasses[sclass],
             };
+            std.debug.assert(self.getHeader(curIdx) != null);
+            if (self.sclasses[sclass] != index_sentinel) {
+                std.debug.assert(self.getHeader(self.sclasses[sclass]).?.next == index_sentinel);
+                self.getHeader(self.sclasses[sclass]).?.next = curIdx;
+            }
             self.sclasses[sclass] = curIdx;
         }
 
         fn removeHeader(self: *Self, header: *FreeHeader, sclass: SClass) void {
             if (header.prev != index_sentinel) {
+                std.debug.assert(self.getHeader(self.getHeader(header.prev).?.next) == header);
                 self.getHeader(header.prev).?.next = header.next;
             }
             if (header.next != index_sentinel) {
+                std.debug.assert(self.getHeader(self.getHeader(header.next).?.prev) == header);
                 self.getHeader(header.next).?.prev = header.prev;
             } else {
+                std.debug.assert(self.getHeader(self.sclasses[sclass]).? == header);
                 self.sclasses[sclass] = header.prev;
             }
+            header.sentinel = uninit;
         }
 
         fn getHeader(self: *Self, pos: usize) ?*FreeHeader {

@@ -27,38 +27,42 @@ pub const Id = packed struct(IdRepr) {
     const sentinel: Id = @bitCast(@as(IdRepr, std.math.maxInt(IdRepr)));
     const uninit: Id = @bitCast(@as(IdRepr, std.math.minInt(IdRepr)));
 
-    pub inline fn init(knd: Kind, index: usize) Id {
+    pub fn lessThen(self: Id, other: Id) bool {
+        return self.repr() < other.repr();
+    }
+
+    pub fn init(knd: Kind, index: usize) Id {
         return .{ .index = @intCast(index), .flag = @intFromEnum(knd) };
     }
 
-    pub inline fn invalid(knd: Kind) Id {
+    pub fn invalid(knd: Kind) Id {
         return init(knd, std.math.maxInt(Index));
     }
 
-    pub inline fn isInvalid(self: Id) bool {
+    pub fn isInvalid(self: Id) bool {
         return self.index == std.math.maxInt(Index);
     }
 
-    pub inline fn kind(self: Id) Kind {
+    pub fn kind(self: Id) Kind {
         return @enumFromInt(self.flag);
     }
 
-    pub inline fn repr(self: Id) IdRepr {
+    pub fn repr(self: Id) IdRepr {
         return @bitCast(self);
     }
 
-    pub inline fn eql(self: Id, other: Id) bool {
+    pub fn eql(self: Id, other: Id) bool {
         return self.repr() == other.repr();
     }
 
     pub fn format(
         self: Id,
-        comptime fmt: []const u8,
+        comptime ft: []const u8,
         options: std.fmt.FormatOptions,
         writer: anytype,
     ) !void {
         _ = options;
-        _ = fmt;
+        _ = ft;
         try writer.print("{s}{d}", .{ @tagName(self.kind()), self.index });
     }
 };
@@ -93,19 +97,20 @@ pub const Slice = struct {
             },
             else => {
                 const cap = Slices.sizeOf(self.meta.cap_pow2);
-                if (self.meta.len == cap) b: {
-                    if (slices.grow(self.data.base, self.meta.len)) break :b;
-
-                    const idx = try slices.alloc(gpa, self.meta.len * 2);
-                    @memcpy(slices.mem.ptr[idx..], slices.mem[self.data.base..][0..self.meta.len]);
-                    slices.free(self.data.base, self.meta.len);
-                    self.data.base = idx;
+                if (self.meta.len == cap) {
+                    if (!slices.grow(self.data.base, self.meta.len)) {
+                        const idx = try slices.alloc(gpa, self.meta.len * 2);
+                        @memcpy(slices.mem.ptr[idx..], slices.mem[self.data.base..][0..self.meta.len]);
+                        slices.free(self.data.base, self.meta.len);
+                        self.data.base = idx;
+                    }
                     self.meta.cap_pow2 += 1;
                 }
                 slices.mem[self.data.base + self.meta.len] = value;
             },
         }
         self.meta.len += 1;
+        if (debug) for (self.view(slices.*)) |el| std.debug.assert(!el.eql(Id.sentinel));
     }
 
     pub fn pop(self: *Slice, slices: *Slices) Id {
@@ -121,6 +126,7 @@ pub const Slice = struct {
             },
             else => if (self.meta.len - 1 == cap / 2) {
                 slices.shrink(self.data.base, @intCast(cap));
+                self.meta.cap_pow2 -= 1;
             },
         }
         self.meta.len -= 1;
@@ -140,15 +146,20 @@ pub const Slice = struct {
 };
 
 pub const Kind = enum {
+    // NOTE: ordering is deliberate (see Parser.peepholeBinOp)
+    const_int,
     cfg_start,
     cfg_tuple,
+    cfg_if,
+    @"cfg_if:true",
+    @"cfg_if:false",
     cfg_return,
+    cfg_unreachable,
+    @"uo-",
     @"bo+",
     @"bo-",
     @"bo*",
     @"bo/",
-    @"uo-",
-    const_int,
 
     pub fn isCommutative(self: Kind) bool {
         return switch (self) {
@@ -210,14 +221,18 @@ pub const BinOp = extern struct { lhs: Id, rhs: Id };
 pub const UnOp = extern struct { oper: Id };
 pub const Int = extern struct { value: i64 };
 pub const Tuple = extern struct { on: Id, index: u32 };
+pub const If = extern struct { cfg: Id, cond: Id };
+pub const Empty = extern struct {};
 
 pub const Inputs = union {
-    cfg_start: void,
+    cfg_start: Empty,
     cfg_tuple: Tuple,
+    cfg_if: If,
     cfg_return: Return,
-    bo: BinOp,
-    uo: UnOp,
+    cfg_unreachable: Empty,
     const_int: Int,
+    uo: UnOp,
+    bo: BinOp,
 
     fn init(payload: anytype) Inputs {
         return @unionInit(Inputs, nameForPayload(@TypeOf(payload)), payload);
@@ -241,7 +256,6 @@ pub const Inputs = union {
 
     fn countIds(comptime payload: []const u8) usize {
         const P = @TypeOf(@field(@as(Inputs, undefined), payload));
-        if (P == void) return 0;
         var count: usize = 0;
         std.debug.assert(@typeInfo(P).Struct.layout == .@"extern");
         for (@typeInfo(P).Struct.fields) |field| {
@@ -257,6 +271,11 @@ pub const Node = struct {
     refs: Slice = .{},
     inputs: Inputs,
 };
+
+fn dbg(any: anytype) @TypeOf(any) {
+    std.debug.print("{any}\n", .{any});
+    return any;
+}
 
 pub const Fmt = struct {
     son: *Son,
@@ -320,8 +339,10 @@ pub fn add(self: *Son, gpa: std.mem.Allocator, comptime kind: Kind, inputs: kind
         const new_len = @max(self.nodes.len * 2, min_cap);
         const old_len = self.nodes.len;
         self.nodes = try gpa.realloc(self.nodes, new_len);
-        for (self.nodes[old_len..], 0..) |*elem, i| {
-            elem.* = .{ .next = self.free };
+        var i = self.nodes.len;
+        while (old_len < i) {
+            i -= 1;
+            self.nodes[i] = .{ .next = self.free };
             self.free = @intCast(i);
         }
     }
@@ -337,6 +358,12 @@ pub fn rmeove(self: *Son, index: usize) void {
     std.debug.assert(self.nodes[index].elem.refs.len() == 0);
     self.nodes[index] = .{ .next = self.free };
     self.free = @intCast(index);
+}
+
+pub fn fmt(self: *Son, root: Id, out: *std.ArrayList(u8)) !void {
+    var fm = Fmt{ .son = self, .out = out };
+    defer fm.deinit();
+    try fm.fmt(root);
 }
 
 pub fn collectLeakedIds(self: *const Son, root: Id, into: *std.ArrayList(Id)) !void {

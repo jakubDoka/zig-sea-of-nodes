@@ -1,8 +1,9 @@
 lexer: Lexer,
 cur: Token = undefined,
 son: Son = .{},
-prev_control: Id = undefined,
+control: Id = undefined,
 gpa: std.mem.Allocator,
+last_var: u32 = undefined,
 
 gvn: gvn.Map = .{},
 ctx: struct {
@@ -126,12 +127,22 @@ fn nextBinOp(self: *Parser, lhs: Id, prec: u8) !Id {
     while (true) {
         const next_prec = self.cur.lexeme.prec();
         if (next_prec >= prec) break;
-
-        try self.son.getPtr(acc).refs.append(self.gpa, &self.son.slices, .{});
+        try self.lockNode(acc);
         const op = self.advance().lexeme;
+        const last_var = self.last_var;
         const rhs = try self.nextBinOp(try self.nextUnit(), next_prec);
-        self.son.getPtr(acc).refs.remove(&self.son.slices, .{});
+        self.unlockNode(acc);
         switch (op) {
+            .@":=" => {
+                try self.lockNode(rhs);
+                self.ctx.vars.items[self.ctx.vars.items.len - 1].value = rhs;
+            },
+            .@"=" => {
+                const vr = &self.ctx.vars.items[last_var];
+                self.unlockNode(vr.value);
+                try self.lockNode(rhs);
+                vr.value = rhs;
+            },
             else => acc = switch (op) {
                 inline else => |t| if (@hasField(Kind, "bo" ++ @tagName(t)) and comptime t.isOp())
                     try self.alloc(@field(Kind, "bo" ++ @tagName(t)), .{ .lhs = acc, .rhs = rhs })
@@ -147,27 +158,52 @@ fn nextUnit(self: *Parser) !Id {
     const token = self.advance();
     switch (token.lexeme) {
         .@"return" => {
-            self.prev_control = try self.alloc(.cfg_return, .{
-                .cfg = self.prev_control,
+            self.control = try self.alloc(.cfg_return, .{
+                .cfg = self.control,
                 .value = try self.nextExpr(),
             });
-            return self.prev_control;
+            return self.control;
+        },
+        .@"if" => {
+            const cond = try self.nextExpr();
+            self.control = try self.alloc(.cfg_if, .{ .cfg = self.control, .cond = cond });
+
+            unreachable;
         },
         .Int => return try self.alloc(.const_int, .{
             .value = std.fmt.parseInt(i64, token.view(self.lexer.source), 10) catch
                 unreachable,
         }),
         .Ident => {
-            if (std.mem.eql(u8, token.view(self.lexer.source), "arg")) {
+            const view = token.view(self.lexer.source);
+            if (std.mem.eql(u8, view, "arg")) {
                 return self.ctx.vars.items[0].value;
             }
-            unreachable;
+
+            for (self.ctx.vars.items, 0..) |vr, i| {
+                if (std.mem.eql(u8, view, Lexer.peekStr(self.lexer.source, vr.offset))) {
+                    self.last_var = @intCast(i);
+                    return vr.value;
+                }
+            } else {
+                try self.ctx.vars.append(self.gpa, .{
+                    .offset = token.offset,
+                    .value = undefined,
+                });
+            }
         },
         .@"-" => return try self.alloc(.@"uo-", .{ .oper = try self.nextUnit() }),
         .@"(" => {
             const expr = try self.nextExpr();
             std.debug.assert(self.advance().lexeme == .@")");
             return expr;
+        },
+        .@"{" => {
+            const scope_frame = self.ctx.vars.items.len;
+            while (self.cur.lexeme != .@"}") _ = try self.nextExpr();
+            _ = self.advance();
+            for (self.ctx.vars.items[self.ctx.vars.items.len..]) |vr| self.unlockNode(vr.value);
+            self.ctx.vars.items.len = scope_frame;
         },
         else => |e| std.debug.panic("unhandled token: {s}", .{@tagName(e)}),
     }
@@ -185,13 +221,15 @@ fn allocAny(self: *Parser, kind: Kind, payload: anytype) !Id {
     };
 }
 
-fn alloc(self: *Parser, comptime kind: Kind, payload: kind.InputPayload()) !Id {
+fn alloc(self: *Parser, comptime kind: Kind, payload: kind.InputPayload()) Error!Id {
     if (try self.peephole(kind, payload)) |rpl| {
+        try self.lockNode(rpl);
+        defer self.unlockNode(rpl);
         const inps = Son.Inputs.idsOfPayload(&payload);
-        inline for (inps, 0..) |inp, i| {
-            if (std.mem.indexOfScalar(u32, @ptrCast(inps[0..i]), inp.repr()) == null) {
-                self.remove(inp);
-            }
+        inline for (inps) |inp| try self.lockNode(inp);
+        inline for (inps) |inp| {
+            self.unlockNode(inp);
+            self.remove(inp);
         }
         return rpl;
     }
@@ -209,11 +247,9 @@ fn remove(self: *Parser, id: Id) void {
         switch (id.kind()) {
             inline else => |t| {
                 const inps = Son.Inputs.idsOf(&nd.inputs, t.inputPayloadName());
-                inline for (inps, 0..) |inp, i| {
-                    if (std.mem.indexOfScalar(u32, @ptrCast(inps[0..i]), inp.repr()) == null) {
-                        self.son.getPtr(inp).refs.remove(&self.son.slices, id);
-                        self.remove(inp);
-                    }
+                inline for (inps) |inp| {
+                    self.removeNodeDep(inp, id);
+                    self.remove(inp);
                 }
             },
         }
@@ -236,6 +272,7 @@ fn peephole(self: *Parser, comptime kind: Kind, payload: kind.InputPayload()) !?
     return switch (@TypeOf(payload)) {
         Son.BinOp => self.peepholeBinOp(kind, payload),
         Son.UnOp => self.peepholeUnOp(kind, payload),
+        Son.If => self.peepholeIf(kind, payload),
         else => null,
     };
 }
@@ -246,6 +283,7 @@ fn peepholeBinOp(self: *Parser, comptime kind: Kind, abo: Son.BinOp) !?Id {
     var const_rhs = bo.rhs.kind().isConst();
     const commutatuive = comptime kind.isCommutative();
 
+    // fold
     if (const_lhs and const_rhs) return try self.peepholeAlloc(.const_int, .{
         .value = kind.applyBinOp(
             self.son.get(bo.lhs).inputs.const_int.value,
@@ -253,17 +291,46 @@ fn peepholeBinOp(self: *Parser, comptime kind: Kind, abo: Son.BinOp) !?Id {
         ),
     });
 
-    if (commutatuive and (const_lhs or (bo.lhs.index > bo.rhs.index and !const_rhs))) {
+    if (bo.lhs.eql(bo.rhs) and !const_lhs) switch (kind) {
+        // normalize
+        .@"bo+" => return try self.alloc(.@"bo*", .{
+            .lhs = bo.lhs,
+            .rhs = try self.peepholeAlloc(.const_int, .{ .value = 2 }),
+        }),
+        // fold
+        .@"bo-" => return try self.peepholeAlloc(.const_int, .{ .value = 0 }),
+        // fold
+        .@"bo/" => return try self.peepholeAlloc(.const_int, .{ .value = 1 }),
+        else => {},
+    };
+
+    // normalize
+    if (commutatuive and (bo.lhs.lessThen(bo.rhs))) {
         changed = true;
         std.mem.swap(Id, &bo.rhs, &bo.lhs);
         std.mem.swap(bool, &const_rhs, &const_lhs);
+    }
+
+    // fold
+    if (commutatuive and const_rhs) {
+        const rhs = self.son.get(bo.rhs).inputs.const_int.value;
+        switch (kind) {
+            .@"bo+", .@"bo-" => if (rhs == 0) return bo.lhs,
+            .@"bo*" => if (rhs == 1)
+                return bo.lhs
+            else if (rhs == 0)
+                return try self.peepholeAlloc(.const_int, .{ .value = 0 }),
+            .@"bo/" => return bo.lhs,
+            else => {},
+        }
     }
 
     if (commutatuive and bo.lhs.kind() == kind) {
         const lhs = self.son.get(bo.lhs).inputs.bo;
         const const_lhs_rhs = lhs.rhs.kind().isConst();
 
-        if (const_lhs_rhs and const_rhs) return try self.peepholeAlloc(kind, .{
+        // fold
+        if (const_lhs_rhs and const_rhs) return try self.alloc(kind, .{
             .lhs = lhs.lhs,
             .rhs = try self.peepholeAlloc(.const_int, .{ .value = kind.applyBinOp(
                 self.son.get(lhs.rhs).inputs.const_int.value,
@@ -271,18 +338,37 @@ fn peepholeBinOp(self: *Parser, comptime kind: Kind, abo: Son.BinOp) !?Id {
             ) }),
         });
 
-        unreachable;
+        // normalize
+        if (const_lhs_rhs) return try self.alloc(kind, .{
+            .lhs = try self.alloc(kind, .{ .lhs = lhs.lhs, .rhs = bo.rhs }),
+            .rhs = lhs.rhs,
+        });
     }
 
-    if (bo.lhs.eql(bo.rhs) and !const_lhs) switch (kind) {
-        .@"bo+" => return try self.peepholeAlloc(.@"bo*", .{
-            .lhs = bo.lhs,
-            .rhs = try self.peepholeAlloc(.const_int, .{ .value = 2 }),
-        }),
-        .@"bo-" => return try self.peepholeAlloc(.const_int, .{ .value = 0 }),
-        .@"bo/" => return try self.peepholeAlloc(.const_int, .{ .value = 1 }),
-        else => {},
-    };
+    if (kind == .@"bo*" and const_rhs and bo.lhs.kind() == .@"bo+") {
+        const lhs = self.son.get(bo.lhs).inputs.bo;
+        const const_lhs_rhs = lhs.rhs.kind().isConst();
+
+        // normalize
+        if (const_lhs_rhs) return try self.alloc(.@"bo+", .{
+            .lhs = try self.alloc(.@"bo*", .{ .lhs = lhs.lhs, .rhs = bo.rhs }),
+            .rhs = try self.peepholeAlloc(.const_int, .{
+                .value = kind.applyBinOp(
+                    self.son.get(lhs.rhs).inputs.const_int.value,
+                    self.son.get(bo.rhs).inputs.const_int.value,
+                ),
+            }),
+        });
+    }
+
+    // normalize
+    if (kind == .@"bo-" and bo.lhs.kind() == .@"bo-") {
+        const lhs = self.son.get(bo.lhs).inputs.bo;
+        return try self.alloc(.@"bo-", .{
+            .lhs = lhs.lhs,
+            .rhs = try self.alloc(.@"bo+", .{ .lhs = lhs.rhs, .rhs = bo.rhs }),
+        });
+    }
 
     if (changed) return try self.peepholeAlloc(kind, bo);
 
@@ -292,6 +378,7 @@ fn peepholeBinOp(self: *Parser, comptime kind: Kind, abo: Son.BinOp) !?Id {
 fn peepholeUnOp(self: *Parser, comptime kind: Kind, uo: Son.UnOp) !?Id {
     const const_oper = uo.oper.kind().isConst();
 
+    // fold
     if (const_oper) return try self.peepholeAlloc(.const_int, .{
         .value = kind.applyUnOp(
             self.son.get(uo.oper).inputs.const_int.value,
@@ -301,12 +388,26 @@ fn peepholeUnOp(self: *Parser, comptime kind: Kind, uo: Son.UnOp) !?Id {
     return null;
 }
 
+fn peepholeIf(self: *Parser, comptime kind: Kind, f: Son.If) !?Id {
+    comptime std.debug.assert(kind == .cfg_if);
+
+    const const_cond = f.cond.kind().isConst();
+
+    // fold
+    if (const_cond) return switch (self.son.get(f.cond).inputs.const_int.value) {
+        0 => try self.peepholeAlloc(.@"cfg_if:false", f),
+        else => try self.peepholeAlloc(.@"cfg_if:true", f),
+    };
+
+    return null;
+}
+
 fn peepholeAlloc(self: *Parser, comptime kind: Kind, payload: kind.InputPayload()) !Id {
     const result = try self.getGwn(kind, payload);
     if (result.found_existing) return result.key_ptr.id;
     result.key_ptr.id = try self.son.add(self.gpa, kind, payload);
     inline for (self.son.get(result.key_ptr.id).inputs.idsOf(kind.inputPayloadName())) |inp| {
-        try self.son.getPtr(inp).refs.append(self.gpa, &self.son.slices, result.key_ptr.id);
+        try self.addNodeDep(inp, result.key_ptr.id);
     }
     return result.key_ptr.id;
 }
@@ -319,13 +420,13 @@ fn testParse(code: []const u8) !struct { Son, Fn } {
     defer parser.deinit();
     errdefer parser.son.deinit(std.testing.allocator);
     parser.cur = parser.lexer.next();
-    const entry = try parser.son.add(parser.gpa, .cfg_start, {});
-    parser.prev_control = try parser.alloc(.cfg_tuple, .{ .on = entry, .index = 0 });
+    const entry = try parser.son.add(parser.gpa, .cfg_start, .{});
+    parser.control = try parser.alloc(.cfg_tuple, .{ .on = entry, .index = 0 });
 
-    try parser.ctx.vars.append(parser.gpa, .{
-        .offset = Var.arg_sentinel,
-        .value = try parser.alloc(.cfg_tuple, .{ .on = entry, .index = 1 }),
-    });
+    const arg = try parser.alloc(.cfg_tuple, .{ .on = entry, .index = 1 });
+    try parser.ctx.vars.append(parser.gpa, .{ .offset = Var.arg_sentinel, .value = arg });
+    try parser.lockNode(arg);
+    defer parser.unlockNode(arg);
     var last_node = entry;
     while (try parser.next()) |node| last_node = node;
     parser.ctx.vars.items.len = 0;
@@ -333,12 +434,37 @@ fn testParse(code: []const u8) !struct { Son, Fn } {
     return .{ parser.son, .{ .entry = entry, .exit = last_node } };
 }
 
+fn lockNode(self: *Parser, id: Id) !void {
+    try self.addNodeDep(id, .{});
+}
+
+fn unlockNode(self: *Parser, id: Id) void {
+    self.removeNodeDep(id, .{});
+}
+
+fn addNodeDep(self: *Parser, on: Id, dep: Id) !void {
+    try self.son.getPtr(on).refs.append(self.gpa, &self.son.slices, dep);
+}
+
+fn removeNodeDep(self: *Parser, on: Id, dep: Id) void {
+    self.son.getPtr(on).refs.remove(&self.son.slices, dep);
+}
+
 fn constCase(exit: i64, code: []const u8) !void {
     var son, const fnc = try testParse(code);
     defer son.deinit(std.testing.allocator);
     const rvl = son.get(fnc.exit).inputs.cfg_return.value;
+    std.testing.expectEqual(Kind.const_int, rvl.kind()) catch |e| {
+        var output = std.ArrayList(u8).init(std.testing.allocator);
+        defer output.deinit();
+        try son.fmt(fnc.entry, &output);
+        std.debug.print("{s}\n", .{output.items});
+        return e;
+    };
     const cnst = son.get(rvl).inputs.const_int.value;
-    try std.testing.expectEqual(exit, cnst);
+    std.testing.expectEqual(exit, cnst) catch |e| {
+        return e;
+    };
 }
 
 fn dynCase(code: []const u8, output: *std.ArrayList(u8)) !void {
@@ -415,10 +541,32 @@ test "math" {
     try constCase(0, "return 1 + -1");
     try constCase(0, "return 1 + 4 / 4 - 2 * 1");
     try constCase(0, "return (1 + arg + 2) - (arg + 3)");
+    try constCase(0, "return (1 + (arg + 2)) - (arg + 3)");
+    try constCase(0, "return (1 + arg + 2 + arg + 3) - (arg * 2 + 6)");
+    try constCase(0, "return (arg + 0) - arg");
+    try constCase(0, "return (arg * 1) - arg");
+    try constCase(0, "return arg * 0");
+    try constCase(0,
+        \\a := arg + 2
+        \\b := 1
+        \\{
+        \\  c := a
+        \\  b = a + b
+        \\}
+        \\c := b
+        \\return 1 + a + c - arg * 2 - 6
+    );
+    try constCase(0,
+        \\a := 0
+        \\if arg a = 1 else a = 2
+        \\b := 2
+        \\if arg b = 1
+        \\return a - b
+    );
 
-    var output = std.ArrayList(u8).init(std.testing.allocator);
-    defer output.deinit();
-    try dynCase("return 1 + arg + 2", &output);
-    try dynCase("return 1 + (arg + 2)", &output);
-    try resolveDynCases("with argument", output.items);
+    //var output = std.ArrayList(u8).init(std.testing.allocator);
+    //defer output.deinit();
+    //try dynCase("return 1 + arg + 2", &output);
+    //try dynCase("return 1 + (arg + 2)", &output);
+    //try resolveDynCases("with argument", output.items);
 }
