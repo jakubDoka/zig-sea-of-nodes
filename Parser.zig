@@ -2,15 +2,19 @@ lexer: Lexer,
 cur: Token = undefined,
 son: Son = .{},
 control: Id = undefined,
+end: Id = undefined,
 gpa: std.mem.Allocator,
 last_var: u32 = undefined,
-
 gvn: gvn.Map = .{},
 ctx: struct {
     vars: std.ArrayListUnmanaged(Var) = .{},
+    var_changes: std.ArrayListUnmanaged(VarChange) = .{},
+    var_change_base: usize = 0,
+    var_branch_base: usize = 0,
 } = .{},
 
 const std = @import("std");
+const dbg = @import("main.zig").dbg;
 const debug = @import("builtin").mode == .Debug;
 const Lexer = @import("Lexer.zig");
 const Token = Lexer.Token;
@@ -84,12 +88,16 @@ const Var = struct {
     const arg_sentinel = std.math.maxInt(u32);
 };
 
-fn dbg(any: anytype) @TypeOf(any) {
-    std.debug.print("{any}\n", .{any});
-    return any;
-}
+const VarChange = struct {
+    var_index: packed struct { right: bool = true, i: u31 },
+    prev_value: Id,
 
-pub fn assertIntegirty(self: Parser, entry: Id) !void {
+    fn lessThen(_: void, a: VarChange, b: VarChange) bool {
+        return @as(u32, @bitCast(a.var_index)) < @as(u32, @bitCast(b.var_index));
+    }
+};
+
+pub fn assertIntegirty(self: *Parser, entry: Id) !void {
     var leaked = std.ArrayList(Id).init(self.gpa);
     defer leaked.deinit();
     try self.son.collectLeakedIds(entry, &leaked);
@@ -97,7 +105,7 @@ pub fn assertIntegirty(self: Parser, entry: Id) !void {
         switch (it.kind()) {
             inline else => |k| {
                 const payload = @field(self.son.get(it).inputs, k.inputPayloadName());
-                std.debug.print("{}: {any}\n", .{ it, payload });
+                std.debug.print("{}: {any} {any}\n", .{ it, payload, self.son.getPtr(it).refs.view(self.son.slices) });
             },
         }
     }
@@ -106,8 +114,13 @@ pub fn assertIntegirty(self: Parser, entry: Id) !void {
 
 pub fn deinit(self: *Parser) void {
     inline for (@typeInfo(@TypeOf(self.ctx)).Struct.fields) |field| {
-        std.debug.assert(@field(self.ctx, field.name).items.len == 0);
-        @field(self.ctx, field.name).deinit(self.gpa);
+        switch (field.type) {
+            usize => std.debug.assert(@field(self.ctx, field.name) == 0),
+            else => {
+                std.debug.assert(@field(self.ctx, field.name).items.len == 0);
+                @field(self.ctx, field.name).deinit(self.gpa);
+            },
+        }
     }
     self.gvn.deinit(self.gpa);
     self.* = undefined;
@@ -139,7 +152,17 @@ fn nextBinOp(self: *Parser, lhs: Id, prec: u8) !Id {
             },
             .@"=" => {
                 const vr = &self.ctx.vars.items[last_var];
-                self.unlockNode(vr.value);
+                if (last_var >= self.ctx.var_branch_base or
+                    for (self.ctx.var_changes.items[self.ctx.var_change_base..]) |*change|
+                {
+                    if (change.var_index.i == last_var) break true;
+                } else b: {
+                    try self.ctx.var_changes.append(self.gpa, .{
+                        .var_index = .{ .i = @intCast(last_var) },
+                        .prev_value = vr.value,
+                    });
+                    break :b false;
+                }) self.unlockAndRemove(vr.value);
                 try self.lockNode(rhs);
                 vr.value = rhs;
             },
@@ -158,22 +181,99 @@ fn nextUnit(self: *Parser) !Id {
     const token = self.advance();
     switch (token.lexeme) {
         .@"return" => {
-            self.control = try self.alloc(.cfg_return, .{
+            _ = try self.alloc(.cfg_return, .{
                 .cfg = self.control,
+                .end = self.end,
                 .value = try self.nextExpr(),
             });
-            return self.control;
+            self.control = try self.allocNopi(.cfg_start, .{});
         },
         .@"if" => {
-            const cond = try self.nextExpr();
-            self.control = try self.alloc(.cfg_if, .{ .cfg = self.control, .cond = cond });
+            const prev_var_branch_base = self.ctx.var_branch_base;
+            defer self.ctx.var_branch_base = prev_var_branch_base;
+            self.ctx.var_branch_base = self.ctx.vars.items.len;
+            const prev_var_change_base = self.ctx.var_change_base;
+            defer self.ctx.var_change_base = prev_var_change_base;
 
-            unreachable;
+            var full_var_change_base = self.ctx.var_changes.items.len;
+
+            const prev_control = self.control;
+            try self.lockNode(prev_control);
+            defer self.unlockNode(prev_control);
+
+            const cond = try self.nextExpr();
+            const if_control = try self.alloc(.cfg_if, .{ .cfg = self.control, .cond = cond });
+
+            {
+                try self.lockNode(if_control);
+                defer self.unlockNode(if_control);
+                self.control = try self.alloc(.cfg_tuple, .{ .cfg = if_control, .index = 0 });
+            }
+            self.ctx.var_change_base = self.ctx.var_changes.items.len;
+            _ = try self.nextExpr();
+            const then = self.control;
+
+            for (self.ctx.var_changes.items[full_var_change_base..]) |*change| {
+                change.var_index.right = false;
+                std.mem.swap(Id, &change.prev_value, &self.ctx.vars.items[change.var_index.i].value);
+            }
+
+            self.control = try self.alloc(.cfg_tuple, .{ .cfg = if_control, .index = 1 });
+            self.ctx.var_change_base = self.ctx.var_changes.items.len;
+            if (self.cur.lexeme == .@"else") {
+                _ = self.advance();
+                _ = try self.nextExpr();
+            }
+            const @"else" = self.control;
+
+            self.control = try self.allocNopi(.cfg_region, .{ .lcfg = then, .rcfg = @"else" });
+            try self.lockNode(self.control);
+
+            const changes = self.ctx.var_changes.items[full_var_change_base..];
+            std.sort.pdq(VarChange, changes, {}, VarChange.lessThen);
+
+            var i: usize = 0;
+            while (i < changes.len) {
+                const change = changes[i];
+                i += 1;
+                const variable = &self.ctx.vars.items[change.var_index.i];
+                const phi = try self.alloc(.phi, .{
+                    .region = self.control,
+                    .left = change.prev_value,
+                    .right = variable.value,
+                });
+                if (change.var_index.right) {
+                    self.unlockAndRemove(variable.value);
+                    variable.value = change.prev_value;
+                } else {
+                    self.unlockAndRemove(change.prev_value);
+                    if (i < changes.len and changes[i].var_index.i == change.var_index.i) {
+                        self.unlockAndRemove(variable.value);
+                        variable.value = changes[i].prev_value;
+                        i += 1;
+                    }
+                }
+                if (change.var_index.i < prev_var_branch_base) {
+                    self.ctx.var_changes.items[full_var_change_base] = .{
+                        .var_index = .{ .i = change.var_index.i },
+                        .prev_value = variable.value,
+                    };
+                    full_var_change_base += 1;
+                } else self.unlockAndRemove(variable.value);
+                try self.lockNode(phi);
+                variable.value = phi;
+            }
+            self.ctx.var_changes.items.len = full_var_change_base;
+
+            self.unlockNode(self.control);
+            self.control = try self.latePeephole(self.control);
         },
-        .Int => return try self.alloc(.const_int, .{
+        .Int => return try self.allocNopi(.const_int, .{
             .value = std.fmt.parseInt(i64, token.view(self.lexer.source), 10) catch
                 unreachable,
         }),
+        .true => return try self.allocNopi(.const_int, .{ .value = 1 }),
+        .false => return try self.allocNopi(.const_int, .{ .value = 0 }),
         .Ident => {
             const view = token.view(self.lexer.source);
             if (std.mem.eql(u8, view, "arg")) {
@@ -234,7 +334,22 @@ fn alloc(self: *Parser, comptime kind: Kind, payload: kind.InputPayload()) Error
         return rpl;
     }
 
-    return try self.peepholeAlloc(kind, payload);
+    return try self.allocNopi(kind, payload);
+}
+
+fn latePeephole(self: *Parser, id: Id) !Id {
+    const rpl = switch (id.kind()) {
+        inline else => |t| try self.peephole(t, @field(self.son.get(id).inputs, t.inputPayloadName())),
+    } orelse return id;
+    try self.lockNode(rpl);
+    defer self.unlockNode(rpl);
+    self.remove(id);
+    return rpl;
+}
+
+fn unlockAndRemove(self: *Parser, id: Id) void {
+    self.unlockNode(id);
+    self.remove(id);
 }
 
 fn remove(self: *Parser, id: Id) void {
@@ -253,7 +368,7 @@ fn remove(self: *Parser, id: Id) void {
                 }
             },
         }
-        self.son.rmeove(id.index);
+        self.son.rmeove(id);
     }
 }
 
@@ -269,10 +384,27 @@ fn getGwn(self: *Parser, comptime kind: Kind, payload: kind.InputPayload()) !gvn
 }
 
 fn peephole(self: *Parser, comptime kind: Kind, payload: kind.InputPayload()) !?Id {
+    if (comptime for (@typeInfo(@TypeOf(payload)).Struct.fields) |field| {
+        if (std.mem.endsWith(u8, field.name, "cfg")) break true;
+    } else false) {
+        var is_unreachable = true;
+        var last_node: Id = undefined;
+        inline for (@typeInfo(@TypeOf(payload)).Struct.fields) |field| {
+            if (comptime !std.mem.endsWith(u8, field.name, "cfg")) continue;
+            last_node = @field(payload, field.name);
+            is_unreachable = is_unreachable and last_node.kind() == .cfg_start;
+        }
+
+        if (is_unreachable) return last_node;
+    }
+
     return switch (@TypeOf(payload)) {
         Son.BinOp => self.peepholeBinOp(kind, payload),
         Son.UnOp => self.peepholeUnOp(kind, payload),
         Son.If => self.peepholeIf(kind, payload),
+        Son.Tuple => self.peepholeTuple(kind, payload),
+        Son.Phi => self.peepholePhi(kind, payload),
+        Son.Region => self.peepholeRegion(kind, payload),
         else => null,
     };
 }
@@ -284,7 +416,7 @@ fn peepholeBinOp(self: *Parser, comptime kind: Kind, abo: Son.BinOp) !?Id {
     const commutatuive = comptime kind.isCommutative();
 
     // fold
-    if (const_lhs and const_rhs) return try self.peepholeAlloc(.const_int, .{
+    if (const_lhs and const_rhs) return try self.allocNopi(.const_int, .{
         .value = kind.applyBinOp(
             self.son.get(bo.lhs).inputs.const_int.value,
             self.son.get(bo.rhs).inputs.const_int.value,
@@ -295,12 +427,12 @@ fn peepholeBinOp(self: *Parser, comptime kind: Kind, abo: Son.BinOp) !?Id {
         // normalize
         .@"bo+" => return try self.alloc(.@"bo*", .{
             .lhs = bo.lhs,
-            .rhs = try self.peepholeAlloc(.const_int, .{ .value = 2 }),
+            .rhs = try self.allocNopi(.const_int, .{ .value = 2 }),
         }),
         // fold
-        .@"bo-" => return try self.peepholeAlloc(.const_int, .{ .value = 0 }),
+        .@"bo-" => return try self.allocNopi(.const_int, .{ .value = 0 }),
         // fold
-        .@"bo/" => return try self.peepholeAlloc(.const_int, .{ .value = 1 }),
+        .@"bo/" => return try self.allocNopi(.const_int, .{ .value = 1 }),
         else => {},
     };
 
@@ -319,7 +451,7 @@ fn peepholeBinOp(self: *Parser, comptime kind: Kind, abo: Son.BinOp) !?Id {
             .@"bo*" => if (rhs == 1)
                 return bo.lhs
             else if (rhs == 0)
-                return try self.peepholeAlloc(.const_int, .{ .value = 0 }),
+                return try self.allocNopi(.const_int, .{ .value = 0 }),
             .@"bo/" => return bo.lhs,
             else => {},
         }
@@ -332,7 +464,7 @@ fn peepholeBinOp(self: *Parser, comptime kind: Kind, abo: Son.BinOp) !?Id {
         // fold
         if (const_lhs_rhs and const_rhs) return try self.alloc(kind, .{
             .lhs = lhs.lhs,
-            .rhs = try self.peepholeAlloc(.const_int, .{ .value = kind.applyBinOp(
+            .rhs = try self.allocNopi(.const_int, .{ .value = kind.applyBinOp(
                 self.son.get(lhs.rhs).inputs.const_int.value,
                 self.son.get(bo.rhs).inputs.const_int.value,
             ) }),
@@ -352,7 +484,7 @@ fn peepholeBinOp(self: *Parser, comptime kind: Kind, abo: Son.BinOp) !?Id {
         // normalize
         if (const_lhs_rhs) return try self.alloc(.@"bo+", .{
             .lhs = try self.alloc(.@"bo*", .{ .lhs = lhs.lhs, .rhs = bo.rhs }),
-            .rhs = try self.peepholeAlloc(.const_int, .{
+            .rhs = try self.allocNopi(.const_int, .{
                 .value = kind.applyBinOp(
                     self.son.get(lhs.rhs).inputs.const_int.value,
                     self.son.get(bo.rhs).inputs.const_int.value,
@@ -370,7 +502,7 @@ fn peepholeBinOp(self: *Parser, comptime kind: Kind, abo: Son.BinOp) !?Id {
         });
     }
 
-    if (changed) return try self.peepholeAlloc(kind, bo);
+    if (changed) return try self.allocNopi(kind, bo);
 
     return null;
 }
@@ -379,7 +511,7 @@ fn peepholeUnOp(self: *Parser, comptime kind: Kind, uo: Son.UnOp) !?Id {
     const const_oper = uo.oper.kind().isConst();
 
     // fold
-    if (const_oper) return try self.peepholeAlloc(.const_int, .{
+    if (const_oper) return try self.allocNopi(.const_int, .{
         .value = kind.applyUnOp(
             self.son.get(uo.oper).inputs.const_int.value,
         ),
@@ -389,20 +521,115 @@ fn peepholeUnOp(self: *Parser, comptime kind: Kind, uo: Son.UnOp) !?Id {
 }
 
 fn peepholeIf(self: *Parser, comptime kind: Kind, f: Son.If) !?Id {
-    comptime std.debug.assert(kind == .cfg_if);
+    if (kind != .cfg_if) return null;
 
     const const_cond = f.cond.kind().isConst();
 
     // fold
     if (const_cond) return switch (self.son.get(f.cond).inputs.const_int.value) {
-        0 => try self.peepholeAlloc(.@"cfg_if:false", f),
-        else => try self.peepholeAlloc(.@"cfg_if:true", f),
+        0 => try self.allocNopi(.@"cfg_if:false", f),
+        else => try self.allocNopi(.@"cfg_if:true", f),
+    };
+
+    var cursor: ?Id = f.cfg;
+    while (cursor) |nxt| {
+        if (nxt.kind() == .cfg_tuple) {
+            const tup = self.son.get(nxt).inputs.cfg_tuple;
+            if (tup.cfg.kind() == .cfg_if and
+                self.son.get(tup.cfg).inputs.cfg_if.cond.eql(f.cond))
+                return switch (tup.index) {
+                    0 => try self.allocNopi(.@"cfg_if:true", f),
+                    1 => try self.allocNopi(.@"cfg_if:true", f),
+                    else => unreachable,
+                };
+        }
+        cursor = self.dominatorOf(nxt);
+    }
+
+    return null;
+}
+
+fn dominatorOf(self: *Parser, id: Id) ?Id {
+    const node = self.son.get(id).inputs;
+    switch (id.kind()) {
+        .cfg_start => return null,
+        .cfg_region => {
+            _ = node;
+            //var lcfg, var rcfg = node.cfg_region;
+            //while (lcfg != rcfg) {
+            //
+            //}
+            unreachable;
+        },
+        inline else => unreachable,
+    }
+}
+
+fn peepholeTuple(self: *Parser, comptime kind: Kind, tuple: Son.Tuple) !?Id {
+    comptime std.debug.assert(kind == .cfg_tuple);
+
+    if (tuple.cfg.kind() == .@"cfg_if:true") return switch (tuple.index) {
+        0 => self.son.get(tuple.cfg).inputs.cfg_if.cfg,
+        1 => try self.allocNopi(.cfg_start, .{}),
+        else => unreachable,
+    };
+
+    if (tuple.cfg.kind() == .@"cfg_if:false") return switch (tuple.index) {
+        0 => try self.allocNopi(.cfg_start, .{}),
+        1 => self.son.get(tuple.cfg).inputs.cfg_if.cfg,
+        else => unreachable,
     };
 
     return null;
 }
 
-fn peepholeAlloc(self: *Parser, comptime kind: Kind, payload: kind.InputPayload()) !Id {
+fn peepholeRegion(_: *Parser, comptime kind: Kind, region: Son.Region) !?Id {
+    comptime std.debug.assert(kind == .cfg_region);
+
+    if (region.lcfg.kind() == .cfg_start) {
+        std.debug.assert(region.rcfg.kind() != .cfg_start);
+        return region.rcfg;
+    }
+    if (region.rcfg.kind() == .cfg_start) {
+        std.debug.assert(region.lcfg.kind() != .cfg_start);
+        return region.lcfg;
+    }
+
+    return null;
+}
+
+fn peepholePhi(self: *Parser, comptime kind: Kind, phi: Son.Phi) !?Id {
+    comptime std.debug.assert(kind == .phi);
+
+    const region = self.son.get(phi.region).inputs.cfg_region;
+    // fold
+    if (region.lcfg.kind() == .cfg_start) return phi.right;
+    // fold
+    if (region.rcfg.kind() == .cfg_start) return phi.left;
+
+    // fold
+    if (phi.left.eql(phi.right)) return phi.left;
+
+    // normalize
+    if (phi.left.kind() == phi.right.kind() and phi.left.kind().isBinOp()) {
+        const left = self.son.get(phi.left).inputs.bo;
+        const right = self.son.get(phi.left).inputs.bo;
+        return try self.allocNopiAny(phi.left.kind(), .{ .bo = .{
+            .lhs = try self.alloc(.phi, .{ .region = phi.region, .left = left.lhs, .right = right.lhs }),
+            .rhs = try self.alloc(.phi, .{ .region = phi.region, .left = left.rhs, .right = right.rhs }),
+        } });
+    }
+
+    return null;
+}
+
+fn allocNopiAny(self: *Parser, kind: Kind, payload: Son.Inputs) !Id {
+    return switch (kind) {
+        inline else => |t| self.allocNopi(t, @field(payload, t.inputPayloadName())),
+    };
+}
+
+fn allocNopi(self: *Parser, comptime kind: Kind, payload: kind.InputPayload()) !Id {
     const result = try self.getGwn(kind, payload);
     if (result.found_existing) return result.key_ptr.id;
     result.key_ptr.id = try self.son.add(self.gpa, kind, payload);
@@ -410,28 +637,6 @@ fn peepholeAlloc(self: *Parser, comptime kind: Kind, payload: kind.InputPayload(
         try self.addNodeDep(inp, result.key_ptr.id);
     }
     return result.key_ptr.id;
-}
-
-fn testParse(code: []const u8) !struct { Son, Fn } {
-    var parser = Parser{
-        .gpa = std.testing.allocator,
-        .lexer = Lexer{ .source = code },
-    };
-    defer parser.deinit();
-    errdefer parser.son.deinit(std.testing.allocator);
-    parser.cur = parser.lexer.next();
-    const entry = try parser.son.add(parser.gpa, .cfg_start, .{});
-    parser.control = try parser.alloc(.cfg_tuple, .{ .on = entry, .index = 0 });
-
-    const arg = try parser.alloc(.cfg_tuple, .{ .on = entry, .index = 1 });
-    try parser.ctx.vars.append(parser.gpa, .{ .offset = Var.arg_sentinel, .value = arg });
-    try parser.lockNode(arg);
-    defer parser.unlockNode(arg);
-    var last_node = entry;
-    while (try parser.next()) |node| last_node = node;
-    parser.ctx.vars.items.len = 0;
-    try parser.assertIntegirty(entry);
-    return .{ parser.son, .{ .entry = entry, .exit = last_node } };
 }
 
 fn lockNode(self: *Parser, id: Id) !void {
@@ -450,21 +655,47 @@ fn removeNodeDep(self: *Parser, on: Id, dep: Id) void {
     self.son.getPtr(on).refs.remove(&self.son.slices, dep);
 }
 
+fn testParse(code: []const u8) !struct { Son, Fn } {
+    var parser = Parser{
+        .gpa = std.testing.allocator,
+        .lexer = Lexer{ .source = code },
+    };
+    defer parser.deinit();
+    errdefer parser.son.deinit(std.testing.allocator);
+    parser.cur = parser.lexer.next();
+    const entry = try parser.allocNopi(.cfg_start, .{});
+    parser.control = try parser.allocNopi(.cfg_tuple, .{ .cfg = entry, .index = 0 });
+    parser.end = try parser.allocNopi(.cfg_end, .{});
+    try parser.lockNode(parser.end);
+    defer parser.unlockNode(parser.end);
+
+    const arg = try parser.allocNopi(.cfg_tuple, .{ .cfg = entry, .index = 1 });
+    try parser.ctx.vars.append(parser.gpa, .{ .offset = Var.arg_sentinel, .value = arg });
+    try parser.lockNode(arg);
+    defer parser.unlockNode(arg);
+    while (try parser.next() != null) {}
+    parser.ctx.vars.items.len = 0;
+    try parser.assertIntegirty(entry);
+    return .{ parser.son, .{ .entry = entry, .exit = parser.end } };
+}
+
 fn constCase(exit: i64, code: []const u8) !void {
     var son, const fnc = try testParse(code);
     defer son.deinit(std.testing.allocator);
-    const rvl = son.get(fnc.exit).inputs.cfg_return.value;
-    std.testing.expectEqual(Kind.const_int, rvl.kind()) catch |e| {
-        var output = std.ArrayList(u8).init(std.testing.allocator);
-        defer output.deinit();
-        try son.fmt(fnc.entry, &output);
-        std.debug.print("{s}\n", .{output.items});
-        return e;
-    };
-    const cnst = son.get(rvl).inputs.const_int.value;
-    std.testing.expectEqual(exit, cnst) catch |e| {
-        return e;
-    };
+    for (son.getPtr(fnc.exit).refs.view(son.slices)) |ret| {
+        const rvl = son.get(ret).inputs.cfg_return.value;
+        std.testing.expectEqual(Kind.const_int, rvl.kind()) catch |e| {
+            var output = std.ArrayList(u8).init(std.testing.allocator);
+            defer output.deinit();
+            try son.fmt(fnc.entry, &output);
+            std.debug.print("{s}\n", .{output.items});
+            return e;
+        };
+        const cnst = son.get(rvl).inputs.const_int.value;
+        std.testing.expectEqual(exit, cnst) catch |e| {
+            return e;
+        };
+    }
 }
 
 fn dynCase(code: []const u8, output: *std.ArrayList(u8)) !void {
@@ -558,10 +789,27 @@ test "math" {
     );
     try constCase(0,
         \\a := 0
-        \\if arg a = 1 else a = 2
         \\b := 2
-        \\if arg b = 1
+        \\if arg {
+        \\  a = 1
+        \\  b = 1
+        \\} else a = 2
         \\return a - b
+    );
+    try constCase(0,
+        \\if true return 0
+        \\return 2
+    );
+    try constCase(0,
+        \\if false return 2
+        \\return 0
+    );
+    try constCase(0,
+        \\if arg {
+        \\  if arg return 0
+        \\  return 1
+        \\}
+        \\return 0
     );
 
     //var output = std.ArrayList(u8).init(std.testing.allocator);

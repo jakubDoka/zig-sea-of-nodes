@@ -75,7 +75,7 @@ pub const Slice = struct {
     meta: packed struct(u32) {
         len: Slices.Size = 0,
         cap_pow2: Slices.SClass = undefined,
-        _: u12 = undefined,
+        depth: u12 = 0,
     } = .{},
 
     pub fn view(self: *Slice, slices: Slices) []Id {
@@ -119,6 +119,7 @@ pub const Slice = struct {
         const cap = Slices.sizeOf(self.meta.cap_pow2);
         switch (self.meta.len) {
             0 => unreachable,
+            1 => {},
             2 => {
                 const last_value = vew[0];
                 slices.free(self.data.base, 2);
@@ -153,8 +154,10 @@ pub const Kind = enum {
     cfg_if,
     @"cfg_if:true",
     @"cfg_if:false",
+    cfg_region,
     cfg_return,
-    cfg_unreachable,
+    cfg_end,
+    phi,
     @"uo-",
     @"bo+",
     @"bo-",
@@ -216,20 +219,24 @@ pub const Kind = enum {
     }
 };
 
-pub const Return = extern struct { cfg: Id, value: Id };
+pub const Return = extern struct { cfg: Id, end: Id, value: Id };
 pub const BinOp = extern struct { lhs: Id, rhs: Id };
 pub const UnOp = extern struct { oper: Id };
 pub const Int = extern struct { value: i64 };
-pub const Tuple = extern struct { on: Id, index: u32 };
+pub const Tuple = extern struct { cfg: Id, index: u32 };
 pub const If = extern struct { cfg: Id, cond: Id };
-pub const Empty = extern struct {};
+pub const Phi = extern struct { region: Id, left: Id, right: Id };
+pub const Region = extern struct { lcfg: Id, rcfg: Id };
 
 pub const Inputs = union {
-    cfg_start: Empty,
+    cfg_start: extern struct {},
     cfg_tuple: Tuple,
     cfg_if: If,
+    cfg_region: Region,
     cfg_return: Return,
-    cfg_unreachable: Empty,
+    cfg_unreachable: extern struct {},
+    cfg_end: extern struct {},
+    phi: Phi,
     const_int: Int,
     uo: UnOp,
     bo: BinOp,
@@ -354,10 +361,11 @@ pub fn add(self: *Son, gpa: std.mem.Allocator, comptime kind: Kind, inputs: kind
     return Id.init(kind, index);
 }
 
-pub fn rmeove(self: *Son, index: usize) void {
-    std.debug.assert(self.nodes[index].elem.refs.len() == 0);
-    self.nodes[index] = .{ .next = self.free };
-    self.free = @intCast(index);
+pub fn rmeove(self: *Son, id: Id) void {
+    std.debug.assert(self.nodes[id.index].elem.refs.len() == 0);
+    if (debug) std.debug.assert(self.nodes[id.index].elem.kind == id.kind());
+    self.nodes[id.index] = .{ .next = self.free };
+    self.free = @intCast(id.index);
 }
 
 pub fn fmt(self: *Son, root: Id, out: *std.ArrayList(u8)) !void {

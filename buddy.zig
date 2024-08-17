@@ -1,4 +1,5 @@
 const std = @import("std");
+const debug = @import("builtin").mode == .Debug;
 
 fn dbg(any: anytype) @TypeOf(any) {
     std.debug.print("{any}\n", .{any});
@@ -14,6 +15,8 @@ pub fn BuddyAllocator(
     return struct {
         mem: []align(@alignOf(FreeHeader)) T = &.{},
         sclasses: [sclass_count]Index = [_]Index{index_sentinel} ** sclass_count,
+
+        allocations: if (debug) std.ArrayListUnmanaged(Allocation) else void = if (debug) .{},
 
         comptime {
             if (base_cap * @sizeOf(T) < @sizeOf(FreeHeader)) {
@@ -42,6 +45,11 @@ pub fn BuddyAllocator(
             else
                 invertBits(sentinel),
             else => invertBits(sentinel),
+        };
+
+        const Allocation = struct {
+            pos: Index,
+            sclass: SClass,
         };
 
         const FreeHeader = struct {
@@ -74,9 +82,10 @@ pub fn BuddyAllocator(
                 } else {
                     var cursor: Size = @intCast(old_size);
                     while (true) {
-                        self.free(cursor, cursor);
+                        self.freeNoDefrag(cursor, max_sclass);
                         if (cursor >= new_size / 2) break;
                         cursor *= 2;
+                        max_sclass += 1;
                     }
                 }
                 max_sclass = maxSclass(self.mem.len);
@@ -91,8 +100,8 @@ pub fn BuddyAllocator(
 
             var cursor = allc +% size;
             var step = size;
-            for (sclass..alloc_sclass) |_| {
-                self.free(cursor, step);
+            for (sclass..alloc_sclass) |sclss| {
+                self.freeNoDefrag(cursor, @intCast(sclss));
                 cursor +%= step;
                 step *%= 2;
             }
@@ -101,16 +110,20 @@ pub fn BuddyAllocator(
         }
 
         pub fn shrink(self: *Self, idx: Index, size: Size) void {
-            self.free(idx + size / 2, size / 2);
+            self.freeNoDefrag(idx + size / 2, sclassOf(size / 2));
         }
 
         pub fn grow(self: *Self, idx: Index, size: Size) bool {
-            const sclass = sclassOf(size);
-            const buddyPos = buddyPosOf(idx, sclass);
-            if (buddyPos < idx or buddyPos > self.mem.len) return false;
-            const header = self.getHeader(buddyPos) orelse return false;
-            self.removeHeader(header, sclass);
-            return true;
+            _ = self;
+            _ = idx;
+            _ = size;
+            return false;
+            //const sclass = sclassOf(size);
+            //const buddyPos = buddyPosOf(idx, sclass);
+            //if (buddyPos < idx or buddyPos > self.mem.len) return false;
+            //const header = self.getHeader(buddyPos) orelse return false;
+            //self.removeHeader(header, sclass);
+            //return true;
         }
 
         pub fn free(self: *Self, idx: Index, size: Size) void {
@@ -121,12 +134,25 @@ pub fn BuddyAllocator(
                 if (buddyPos >= self.mem.len) break;
                 std.debug.assert(buddyPos < self.mem.len);
                 if (self.getHeader(buddyPos)) |buddy| {
-                    self.removeHeader(buddy, sclass);
+                    if (sclass == 0 or b: {
+                        const header = self.getHeader(buddyPos + base_cap) orelse break :b false;
+                        break :b header.next == std.math.maxInt(Index) and sclass == header.prev;
+                    })
+                        self.removeHeader(buddy, sclass)
+                    else
+                        break;
                 } else break;
                 curIdx = @min(buddyPos, curIdx);
                 sclass += 1;
             }
-            self.getHeaderUnchecked(curIdx).* = .{
+
+            std.debug.assert(!isSentinel(self.mem[curIdx]));
+            self.freeNoDefrag(curIdx, sclass);
+        }
+
+        fn freeNoDefrag(self: *Self, curIdx: Index, sclass: SClass) void {
+            const header = self.getHeaderUnchecked(curIdx);
+            header.* = .{
                 .next = index_sentinel,
                 .prev = self.sclasses[sclass],
             };
@@ -134,6 +160,12 @@ pub fn BuddyAllocator(
             if (self.sclasses[sclass] != index_sentinel) {
                 std.debug.assert(self.getHeader(self.sclasses[sclass]).?.next == index_sentinel);
                 self.getHeader(self.sclasses[sclass]).?.next = curIdx;
+            }
+            if (sclass != 0) {
+                self.getHeaderUnchecked(curIdx + base_cap).* = .{
+                    .next = std.math.maxInt(Index),
+                    .prev = sclass,
+                };
             }
             self.sclasses[sclass] = curIdx;
         }

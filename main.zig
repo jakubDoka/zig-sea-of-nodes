@@ -9,7 +9,7 @@ test {
     _ = @import("Parser.zig");
 }
 
-fn dbg(any: anytype) @TypeOf(any) {
+pub fn dbg(any: anytype) @TypeOf(any) {
     std.debug.print("{any}\n", .{any});
     return any;
 }
