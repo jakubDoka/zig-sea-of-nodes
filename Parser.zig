@@ -552,16 +552,19 @@ fn peepholeIf(self: *Parser, comptime kind: Kind, f: Son.If) !?Id {
 fn dominatorOf(self: *Parser, id: Id) ?Id {
     const node = self.son.get(id).inputs;
     switch (id.kind()) {
-        .cfg_start => return null,
         .cfg_region => {
-            _ = node;
             //var lcfg, var rcfg = node.cfg_region;
             //while (lcfg != rcfg) {
             //
             //}
             unreachable;
         },
-        inline else => unreachable,
+        inline else => |t| {
+            const payload = @field(node, t.inputPayloadName());
+            const fields = @typeInfo(@TypeOf(payload)).Struct.fields;
+            if (fields.len == 0 or comptime !std.mem.eql(u8, fields[0].name, "cfg")) return null;
+            return payload.cfg;
+        },
     }
 }
 
@@ -601,14 +604,14 @@ fn peepholeRegion(_: *Parser, comptime kind: Kind, region: Son.Region) !?Id {
 fn peepholePhi(self: *Parser, comptime kind: Kind, phi: Son.Phi) !?Id {
     comptime std.debug.assert(kind == .phi);
 
+    // fold
+    if (phi.left.eql(phi.right)) return phi.left;
+
     const region = self.son.get(phi.region).inputs.cfg_region;
     // fold
     if (region.lcfg.kind() == .cfg_start) return phi.right;
     // fold
     if (region.rcfg.kind() == .cfg_start) return phi.left;
-
-    // fold
-    if (phi.left.eql(phi.right)) return phi.left;
 
     // normalize
     if (phi.left.kind() == phi.right.kind() and phi.left.kind().isBinOp()) {
@@ -806,6 +809,7 @@ test "math" {
     );
     try constCase(0,
         \\if arg {
+        \\  if arg == 0 {}
         \\  if arg return 0
         \\  return 1
         \\}
