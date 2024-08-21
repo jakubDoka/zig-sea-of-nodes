@@ -14,6 +14,30 @@ pub fn dbg(any: anytype) @TypeOf(any) {
     return any;
 }
 
+pub fn binarySearch(
+    comptime T: type,
+    key: anytype,
+    items: []const T,
+    comptime compareFn: anytype,
+) struct { bool, usize } {
+    var left: usize = 0;
+    var right: usize = items.len;
+
+    while (left < right) {
+        // Avoid overflowing in the midpoint calculation
+        const mid = left + (right - left) / 2;
+        // Compare the key with the midpoint element
+        switch (compareFn(key, items[mid])) {
+            .eq => return .{ true, mid },
+            .gt => left = mid + 1,
+            .lt => right = mid,
+        }
+    }
+
+    std.debug.assert(left == right);
+    return .{ false, left };
+}
+
 const Parser = struct {
     son: *Son,
     lexer: Lexer,

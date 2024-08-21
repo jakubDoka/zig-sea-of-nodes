@@ -10,7 +10,9 @@ pub const Lexeme = enum(u8) {
     @"return",
     @"if",
     @"else",
-    @"while",
+    loop,
+    @"break",
+    @"continue",
 
     true,
     false,
@@ -25,6 +27,7 @@ pub const Lexeme = enum(u8) {
     @"*" = '*',
     @"/" = '/',
     @"<" = '<',
+    @">" = '>',
     @"{" = '{',
     @"}" = '}',
     @"(" = '(',
@@ -37,7 +40,7 @@ pub const Lexeme = enum(u8) {
     pub fn prec(self: Lexeme) u8 {
         return switch (self) {
             .@"=", .@":=" => 15,
-            .@"==", .@"!=", .@"<" => 7,
+            .@"==", .@"!=", .@"<", .@">" => 7,
             .@"+", .@"-" => 4,
             .@"*", .@"/" => 3,
             else => 254,

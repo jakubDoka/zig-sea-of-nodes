@@ -86,6 +86,15 @@ pub const Slice = struct {
         };
     }
 
+    pub fn clear(self: *Slice, slices: *Slices) void {
+        self.meta.len = 0;
+        if (self.meta.len > 1) {
+            const cap = Slices.sizeOf(self.meta.cap_pow2);
+            slices.free(self.data.base, @intCast(cap));
+            self.data = .{ .item = undefined };
+        }
+    }
+
     pub fn append(self: *Slice, gpa: std.mem.Allocator, slices: *Slices, value: Id) !void {
         switch (self.meta.len) {
             0 => self.data = .{ .item = value },
@@ -148,6 +157,7 @@ pub const Slice = struct {
 
 pub const Kind = enum {
     // NOTE: ordering is deliberate (see Parser.peepholeBinOp)
+    cfg_unreachable,
     const_int,
     cfg_start,
     cfg_tuple,
@@ -155,6 +165,7 @@ pub const Kind = enum {
     @"cfg_if:true",
     @"cfg_if:false",
     cfg_region,
+    @"cfg_region:loop",
     cfg_return,
     cfg_end,
     phi,
@@ -163,6 +174,13 @@ pub const Kind = enum {
     @"bo-",
     @"bo*",
     @"bo/",
+    @"bo<",
+    @"bo>",
+    @"bo==",
+
+    pub fn isUnreachable(self: Kind) bool {
+        return self == .cfg_unreachable;
+    }
 
     pub fn isCommutative(self: Kind) bool {
         return switch (self) {
@@ -202,6 +220,9 @@ pub const Kind = enum {
             .@"bo-" => lhs -% rhs,
             .@"bo*" => lhs *% rhs,
             .@"bo/" => @divFloor(lhs, rhs),
+            .@"bo<" => @intFromBool(lhs < rhs),
+            .@"bo>" => @intFromBool(lhs > rhs),
+            .@"bo==" => @intFromBool(lhs == rhs),
             else => @compileError("wat"),
         };
     }
@@ -229,15 +250,15 @@ pub const Phi = extern struct { region: Id, left: Id, right: Id };
 pub const Region = extern struct { lcfg: Id, rcfg: Id };
 
 pub const Inputs = union {
+    cfg_unreachable: extern struct {},
+    const_int: Int,
     cfg_start: extern struct {},
     cfg_tuple: Tuple,
     cfg_if: If,
     cfg_region: Region,
     cfg_return: Return,
-    cfg_unreachable: extern struct {},
     cfg_end: extern struct {},
     phi: Phi,
-    const_int: Int,
     uo: UnOp,
     bo: BinOp,
 
@@ -252,7 +273,13 @@ pub const Inputs = union {
         @compileError("Inputs.init: unrecognized payload: " ++ @typeName(P));
     }
 
-    pub fn idsOf(self: *const Inputs, comptime payload: []const u8) *const [countIds(payload)]Id {
+    pub fn idsOfAny(self: *Inputs, kind: Kind) []Id {
+        return switch (kind) {
+            inline else => |t| self.idsOf(t.inputPayloadName()),
+        };
+    }
+
+    pub fn idsOf(self: *Inputs, comptime payload: []const u8) *[countIds(payload)]Id {
         if (comptime countIds(payload) == 0) return undefined;
         return @ptrCast(&@field(self, payload));
     }
@@ -276,6 +303,9 @@ pub const Inputs = union {
 pub const Node = struct {
     kind: if (debug) Kind else void = undefined,
     refs: Slice = .{},
+    // maybe separate into peep context to save memory
+    peep_deps: Slice = .{},
+    peep_pos: u32 = std.math.maxInt(u32),
     inputs: Inputs,
 };
 
@@ -317,10 +347,14 @@ pub const Fmt = struct {
                 }
 
                 try self.out.append('\n');
-
+                const outs = nd.refs.view(self.son.slices);
+                for (outs) |out| if (out.kind() == .cfg_unreachable) {
+                    try self.out.writer().print("WHYYYYYYYY there is unreachable: {}\n", .{id});
+                };
                 if (comptime t.isCfg()) {
-                    const outs = nd.refs.view(self.son.slices);
-                    for (outs) |out| if (out.kind().isCfg()) try self.fmt(out);
+                    for (outs) |out| if (out.kind() == .cfg_unreachable) {} else if (out.kind().isCfg()) {
+                        try self.fmt(out);
+                    };
                 }
             },
         }
@@ -372,6 +406,38 @@ pub fn fmt(self: *Son, root: Id, out: *std.ArrayList(u8)) !void {
     var fm = Fmt{ .son = self, .out = out };
     defer fm.deinit();
     try fm.fmt(root);
+}
+
+pub fn log(self: *Son, root: Id, gpa: std.mem.Allocator) !void {
+    var out = std.ArrayList(u8).init(gpa);
+    defer out.deinit();
+    try self.fmt(root, &out);
+    std.debug.print("{s}\n", .{out.items});
+}
+
+pub fn logNode(self: *Son, it: Id) void {
+    switch (it.kind()) {
+        inline else => |k| {
+            const payload = @field(self.get(it).inputs, k.inputPayloadName());
+            std.debug.print("{}: {any} {any}\n", .{ it, payload, self.getPtr(it).refs.view(self.slices) });
+        },
+    }
+}
+
+pub fn collectIds(self: *const Son, into: *std.ArrayList(Id)) !void {
+    try into.resize(self.nodes.len);
+    for (into.items, 0..) |*elem, i| elem.* = Id.init(.cfg_start, i);
+
+    var cursor = self.free;
+    while (cursor != sentinel) : (cursor = self.nodes[cursor].next) into.items[cursor] = Id.invalid(.cfg_start);
+
+    var write: usize = 0;
+    for (into.items) |it| {
+        if (it.isInvalid()) continue;
+        into.items[write] = Id.init(self.nodes[it.index].elem.kind, it.index);
+        write += 1;
+    }
+    into.items.len = write;
 }
 
 pub fn collectLeakedIds(self: *const Son, root: Id, into: *std.ArrayList(Id)) !void {
